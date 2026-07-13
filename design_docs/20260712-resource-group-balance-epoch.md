@@ -321,6 +321,43 @@ Carry-over and non-balance pending work is deducted from relevant node/object ca
 
 This MEP does not require segment and channel plans to execute simultaneously. The planner may preserve channel-first policy semantics, but both plan types are accounted for by the same epoch and budget. Repeated channel waves therefore cannot cause an unrelated, overlapping normal epoch to start before reconciliation.
 
+### Convergence criterion and wave-level benefit
+
+Per-object benefit checks are not sufficient for an epoch. Multiple moves can each look beneficial against their local source and target while the complete wave over-corrects or produces little RG-level improvement.
+
+Every snapshot-backed policy adapter must expose one comparable objective for both planning and convergence:
+
+```go
+type ObjectiveValue interface {
+    Compare(other ObjectiveValue) int
+}
+
+type EpochBalancePolicy interface {
+    Plan(snapshot *PlacementSnapshot, budget BalanceWaveBudget) BalanceWave
+    Evaluate(snapshot *PlacementSnapshot) ObjectiveValue
+    ImprovementThreshold() ObjectiveValue
+}
+```
+
+The planner evaluates:
+
+```text
+before = policy.Evaluate(observed snapshot)
+after  = policy.Evaluate(projected snapshot after the complete wave)
+```
+
+A normal wave is eligible for admission only when `after` improves on `before` by at least the policy's wave-level threshold. Planning, admission gating, and the `Converged` decision must use the same objective and deadband.
+
+An RG is converged for the current normal policy when:
+
+1. there is no recovery or hard-placement violation in the RG;
+2. no legal wave within the configured hard budget improves the objective by the minimum threshold; and
+3. unresolved carry-over work is either observed satisfied, safely locked, or quarantined and therefore excluded from duplicate planning.
+
+The first implementation derives this objective from the existing ScoreBased/ChannelLevelScore scoring semantics. Resource-vector objectives are outside this MEP.
+
+Cross-epoch reverse cooldown is not required by this design. If the reconciled snapshot and the shared objective show that a reverse move is beneficial, the move may be legitimate after topology or workload changes. The implementation records reverse-move metrics; a cooldown can be added later only if non-improving reversals remain after wave-level gating.
+
 ### Admission
 
 Planning does not change scheduler state. A task belongs to the epoch only after scheduler admission succeeds.
@@ -760,6 +797,8 @@ Mixed-version QueryNode deployments are supported because the first version of t
 - Hard task limits cannot be exceeded by multiple collections, replicas, shards, or outbound nodes.
 - Only successfully admitted tasks count toward epoch completion and budget.
 - Deterministic plan ordering produces the same wave for the same snapshot.
+- A wave whose aggregate objective improvement is below the threshold is rejected even when its individual plans pass local benefit checks.
+- `Converged` uses the same objective and threshold as wave admission.
 - Duplicate and stale plans are rejected without corrupting reservations.
 - Epoch deadline transitions through reconciliation before `TimedOut`.
 
@@ -796,6 +835,7 @@ Mixed-version QueryNode deployments are supported because the first version of t
 - Object-storage load failures and resource-exhaustion responses.
 - Lost RPC responses where QueryNode applies the operation successfully.
 - A production-scale distribution modeled after issue #51244, verifying bounded in-flight work and the absence of repeated reverse moves under a static target.
+- Under a static target and topology, admitted move count and objective improvement decay across epochs until no further wave is admitted.
 
 ## Rejected Alternatives
 
