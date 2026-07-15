@@ -8,7 +8,7 @@
 - **Related Issues:** [milvus-io/milvus#51244](https://github.com/milvus-io/milvus/issues/51244)
 - **Related Pull Requests:** [milvus-io/milvus#49861](https://github.com/milvus-io/milvus/pull/49861), [milvus-io/milvus#50774](https://github.com/milvus-io/milvus/pull/50774)
 - **Implementation Baseline:** `milvus-io/milvus@4dbaba0042d3952fa75bbb5d2fb9606c6b67f44d`
-- **Implementation Branch:** `xiaofanluan/milvus:feature/resource-group-balance-epoch` at `6b3c870d30efa660955b0a1b1c3806c310d34728`
+- **Implementation Branch:** `xiaofanluan/milvus:feature/resource-group-balance-epoch` at `b454240dc680a7c02c676e1c377ebaac1732dff5`
 - **Implementation Pull Request:** The draft Milvus PR will be opened after the design-doc PR so the implementation can link the published MEP; this line will be updated with that URL in a follow-up design-doc commit.
 - **Released:** Not released
 
@@ -40,20 +40,20 @@ This MEP changes the orchestration and correctness boundary of balancing. It doe
 
 ## Implementation Status
 
-The MVP described by this MEP is implemented and reviewed on the Milvus feature branch. Relative to baseline `4dbaba0042d3952fa75bbb5d2fb9606c6b67f44d`, final implementation commit `6b3c870d30efa660955b0a1b1c3806c310d34728` contains 18 feature commits and changes 33 files. Active rollout remains disabled by default, and the implementation PR has not yet been opened because delivery follows the design-first sequence described below.
+The MVP described by this MEP is implemented and reviewed on the Milvus feature branch. Relative to baseline `4dbaba0042d3952fa75bbb5d2fb9606c6b67f44d`, final implementation commit `b454240dc680a7c02c676e1c377ebaac1732dff5` contains 18 feature commits and changes 33 files. Active rollout remains disabled by default, and the implementation PR has not yet been opened because delivery follows the design-first sequence described below.
 
 | Layer | Status | Milvus commits | Main files |
 |---|---|---|---|
-| Task completion and distribution-aware pending effects | Implemented and reviewed | `6bf9b84c15` | `task/task.go`, `task/scheduler.go` |
-| Typed and generation-aware held admission | Implemented and reviewed | `168a6f437e`, `b6c50586bf` | `task/balance_admission.go`, `task/scheduler.go` |
-| Atomic distribution publication and immutable RG snapshots | Implemented and reviewed | `b39d2070d6` through `0d89d9c141` | `meta/dist_manager.go`, `dist/dist_handler.go`, `balance/epoch_types.go`, `balance/epoch_snapshot.go` |
-| Hard wave budgets, immutable reservations, and projected placement | Implemented and reviewed | `95d9b604fb`, `15f66b47d1` | `balance/epoch_wave.go` |
-| Snapshot-only ScoreBased and ChannelLevel policy | Implemented and reviewed | `b3569f955a` | `balance/epoch_score_policy.go`, `balance/balancer_factory.go` |
-| Tick-driven per-RG epoch state machine | Implemented and reviewed | `47e5ceb6da` through `b5e1640695` | `balance/epoch_manager.go` |
-| `BalanceChecker` integration | Implemented and reviewed | `48b82c12e6` | `checkers/balance_checker.go` |
-| Dynamic rollout configuration | Implemented and reviewed | `6a8e358263` | `configs/milvus.yaml`, `pkg/util/paramtable/component_param.go` |
-| Metrics, shadow mode, and retained-state observation | Implemented and reviewed | `532e6f4908`, `46b797085b` | `pkg/metrics/querycoord_metrics.go`, checker and manager files |
-| #51244 convergence and failure fixtures | Implemented and reviewed | `6b3c870d30` | `balance/epoch_manager_test.go` |
+| Task completion and distribution-aware pending effects | Implemented and reviewed | `89232b82ad` | `task/task.go`, `task/scheduler.go` |
+| Typed and generation-aware held admission | Implemented and reviewed | `6301167abb`, `090cd11a34` | `task/balance_admission.go`, `task/scheduler.go` |
+| Atomic distribution publication and immutable RG snapshots | Implemented and reviewed | `18bf3d3850` through `9e586bcf37` | `meta/dist_manager.go`, `dist/dist_handler.go`, `balance/epoch_types.go`, `balance/epoch_snapshot.go` |
+| Hard wave budgets, immutable reservations, and projected placement | Implemented and reviewed | `81ed05fa0d`, `4e0ca8b074` | `balance/epoch_wave.go` |
+| Snapshot-only ScoreBased and ChannelLevel policy | Implemented and reviewed | `00285d5882` | `balance/epoch_score_policy.go`, `balance/balancer_factory.go` |
+| Tick-driven per-RG epoch state machine | Implemented and reviewed | `cf4cc96145` through `9e8358791e` | `balance/epoch_manager.go` |
+| `BalanceChecker` integration | Implemented and reviewed | `c8c1b18d04` | `checkers/balance_checker.go` |
+| Dynamic rollout configuration | Implemented and reviewed | `c052fdbd66` | `configs/milvus.yaml`, `pkg/util/paramtable/component_param.go` |
+| Metrics, shadow mode, and retained-state observation | Implemented and reviewed | `ba3b96816b`, `13f81066a6` | `pkg/metrics/querycoord_metrics.go`, checker and manager files |
+| #51244 convergence and failure fixtures | Implemented and reviewed | `b454240dc6` | `balance/epoch_manager_test.go` |
 
 The final full `internal/querycoordv2/...` run is green on the approved `mini` macOS development host with the repository native-library RPATH and isolated temporary etcd. The final task review reported zero Critical, Important, or Minor findings. The local worktree can compile the affected Go tests but cannot execute them with the required Milvus dynamic-library RPATH, so behavioral evidence is explicitly attributed to `mini` rather than to the local machine.
 
@@ -1282,7 +1282,7 @@ Mixed-version QueryNode deployments are supported because the first version of t
 
 ### Verified implementation evidence
 
-Behavioral tests were run at final implementation commit `6b3c870d30efa660955b0a1b1c3806c310d34728` on the approved `mini` macOS development host. Every accepted run sourced `scripts/setenv.sh`, supplied the repository native-library RPATH, used a fresh isolated no-auth etcd/local-storage directory, preserved the direct Go test exit code, and verified process, port, and data-directory cleanup.
+Behavioral tests were run at final implementation commit `b454240dc680a7c02c676e1c377ebaac1732dff5` on the approved `mini` macOS development host. Every accepted run sourced `scripts/setenv.sh`, supplied the repository native-library RPATH, used a fresh isolated no-auth etcd/local-storage directory, preserved the direct Go test exit code, and verified process, port, and data-directory cleanup.
 
 The final focused selectors were:
 
