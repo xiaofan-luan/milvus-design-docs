@@ -1287,15 +1287,15 @@ Behavioral tests were run at final implementation commit `b454240dc680a7c02c676e
 The final focused selectors were:
 
 ```bash
-go test -gcflags="all=-N -l" -ldflags="-r ${RPATH}" -tags dynamic,test \
+go test -timeout 120s -gcflags="all=-N -l" -ldflags="-r ${RPATH}" -tags dynamic,test \
   ./internal/querycoordv2/task \
   -run 'TestTask/(TestChannelTaskDeltaSnapshot|TestAdmitBalanceTask|TestTaskDone)' -count=1
 
-go test -gcflags="all=-N -l" -ldflags="-r ${RPATH}" -tags dynamic,test \
+go test -timeout 120s -gcflags="all=-N -l" -ldflags="-r ${RPATH}" -tags dynamic,test \
   ./internal/querycoordv2/balance \
   -run 'Test(PlacementSnapshot|WaveLedger|ProjectedPlacement|ScoreEpochPolicy|ChannelLevelEpochPolicy|EpochManager|BalanceEpoch)' -count=1
 
-go test -gcflags="all=-N -l" -ldflags="-r ${RPATH}" -tags dynamic,test \
+go test -timeout 120s -gcflags="all=-N -l" -ldflags="-r ${RPATH}" -tags dynamic,test \
   ./internal/querycoordv2/checkers \
   -run 'TestBalanceChecker|TestCheckControllerSuite' -count=1
 
@@ -1304,7 +1304,27 @@ go test ./util/paramtable -run 'TestComponentParam_BalanceEpoch' -count=1
 go test ./metrics -run 'TestQueryCoordBalanceEpochMetrics' -count=1
 ```
 
-Results were respectively `0.951s`, `0.833s`, `1.297s`, `0.457s`, and `0.269s`, all exit `0`. The `pkg` commands are run from the nested `pkg` Go module; the superficially similar root-module paths are invalid and are not counted as test evidence.
+The exact accepted package results were:
+
+```text
+FOCUSED_PREFLIGHT_PORTS_CLEAR=1
+FOCUSED_ETCD_HEALTHY=1
+ok  github.com/milvus-io/milvus/internal/querycoordv2/task      0.838s
+FOCUSED_TASK_EXIT=0
+ok  github.com/milvus-io/milvus/internal/querycoordv2/balance   0.847s
+FOCUSED_BALANCE_EXIT=0
+ok  github.com/milvus-io/milvus/internal/querycoordv2/checkers  1.299s
+FOCUSED_CHECKERS_EXIT=0
+ok  github.com/milvus-io/milvus/pkg/v3/util/paramtable          0.317s
+FOCUSED_PARAMTABLE_EXIT=0
+ok  github.com/milvus-io/milvus/pkg/v3/metrics                  0.264s
+FOCUSED_METRICS_EXIT=0
+FOCUSED_PROCESS_CLEAR=1
+FOCUSED_PORTS_CLEAR=1
+FOCUSED_DATA_CLEAR=1
+```
+
+The focused remote wrapper exited `0`. The `pkg` commands are run from the nested `pkg` Go module; the superficially similar root-module paths are invalid and are not counted as test evidence.
 
 The final complete QueryCoord command was:
 
@@ -1314,7 +1334,31 @@ go test -timeout 300s -gcflags="all=-N -l" -ldflags="-r ${RPATH}" \
   -tags dynamic,test ./internal/querycoordv2/... -count=1
 ```
 
-Every QueryCoord package passed. The main package completed in `108.398s`; notable package results include `balance` `2.636s`, `checkers` `5.705s`, `dist` `17.246s`, `meta` `14.795s`, `observers` `29.071s`, and `task` `21.939s`. The preserved command exit was `0`, followed by confirmed temporary-etcd process, port, and data cleanup. Local `gofmt`, `git diff --check`, and balance test-binary compilation also exited `0`.
+The exact accepted output was:
+
+```text
+FULL_PREFLIGHT_PORTS_CLEAR=1
+FULL_ETCD_HEALTHY=1
+ok  github.com/milvus-io/milvus/internal/querycoordv2            107.713s
+ok  github.com/milvus-io/milvus/internal/querycoordv2/assign       3.707s
+ok  github.com/milvus-io/milvus/internal/querycoordv2/balance      2.688s
+ok  github.com/milvus-io/milvus/internal/querycoordv2/checkers     5.780s
+ok  github.com/milvus-io/milvus/internal/querycoordv2/dist        16.654s
+ok  github.com/milvus-io/milvus/internal/querycoordv2/job          5.654s
+ok  github.com/milvus-io/milvus/internal/querycoordv2/meta        14.320s
+?   github.com/milvus-io/milvus/internal/querycoordv2/mocks       [no test files]
+ok  github.com/milvus-io/milvus/internal/querycoordv2/observers   30.964s
+?   github.com/milvus-io/milvus/internal/querycoordv2/params      [no test files]
+ok  github.com/milvus-io/milvus/internal/querycoordv2/session      2.057s
+ok  github.com/milvus-io/milvus/internal/querycoordv2/task        21.461s
+ok  github.com/milvus-io/milvus/internal/querycoordv2/utils        4.422s
+FULL_QUERYCOORD_EXIT=0
+FULL_PROCESS_CLEAR=1
+FULL_PORTS_CLEAR=1
+FULL_DATA_CLEAR=1
+```
+
+The remote wrapper also exited `0`. An independent follow-up scan after both focused and full wrappers confirmed `FOLLOWUP_PROCESS_CLEAR=1`, `FOLLOWUP_PORTS_CLEAR=1`, and `FOLLOWUP_DATA_CLEAR=1`. Local `gofmt` over all 32 branch-modified Go files produced no diff, and `git diff --check` exited `0`.
 
 ### #51244 static-target convergence fixture
 
