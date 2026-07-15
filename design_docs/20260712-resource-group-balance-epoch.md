@@ -8,7 +8,7 @@
 - **Related Issues:** [milvus-io/milvus#51244](https://github.com/milvus-io/milvus/issues/51244)
 - **Related Pull Requests:** [milvus-io/milvus#49861](https://github.com/milvus-io/milvus/pull/49861), [milvus-io/milvus#50774](https://github.com/milvus-io/milvus/pull/50774)
 - **Implementation Baseline:** `milvus-io/milvus@4dbaba0042d3952fa75bbb5d2fb9606c6b67f44d`
-- **Implementation Branch:** `xiaofanluan/milvus:feature/resource-group-balance-epoch` at `b454240dc680a7c02c676e1c377ebaac1732dff5`
+- **Implementation Branch:** `xiaofanluan/milvus:feature/resource-group-balance-epoch` at `5db539d20c4787087386b33347191083a07b9d3c`
 - **Implementation Pull Request:** The draft Milvus PR will be opened after the design-doc PR so the implementation can link the published MEP; this line will be updated with that URL in a follow-up design-doc commit.
 - **Released:** Not released
 
@@ -40,7 +40,7 @@ This MEP changes the orchestration and correctness boundary of balancing. It doe
 
 ## Implementation Status
 
-The MVP described by this MEP is implemented and reviewed on the Milvus feature branch. Relative to baseline `4dbaba0042d3952fa75bbb5d2fb9606c6b67f44d`, final implementation commit `b454240dc680a7c02c676e1c377ebaac1732dff5` contains 18 feature commits and changes 33 files. Active rollout remains disabled by default, and the implementation PR has not yet been opened because delivery follows the design-first sequence described below.
+The MVP described by this MEP is implemented and reviewed on the Milvus feature branch. Relative to baseline `4dbaba0042d3952fa75bbb5d2fb9606c6b67f44d`, final implementation commit `5db539d20c4787087386b33347191083a07b9d3c` contains 19 feature commits and changes 38 files. Its exact tree is `fa0a7b9a4ecb7221b044ac66bf493dbd5a50ca3b`. Active rollout remains disabled by default, and the implementation PR has not yet been opened because delivery follows the design-first sequence described below.
 
 | Layer | Status | Milvus commits | Main files |
 |---|---|---|---|
@@ -54,6 +54,7 @@ The MVP described by this MEP is implemented and reviewed on the Milvus feature 
 | Dynamic rollout configuration | Implemented and reviewed | `c052fdbd66` | `configs/milvus.yaml`, `pkg/util/paramtable/component_param.go` |
 | Metrics, shadow mode, and retained-state observation | Implemented and reviewed | `ba3b96816b`, `13f81066a6` | `pkg/metrics/querycoord_metrics.go`, checker and manager files |
 | #51244 convergence and failure fixtures | Implemented and reviewed | `b454240dc6` | `balance/epoch_manager_test.go` |
+| Ambiguous balance RPC outcome preservation | Implemented and reviewed | `5db539d20c` | `session/rpc_outcome.go`, `session/cluster.go`, `task/execution_outcome.go`, `task/executor.go`, `balance/epoch_manager.go` |
 
 The final full `internal/querycoordv2/...` run is green on the approved `mini` macOS development host with the repository native-library RPATH and isolated temporary etcd. The final task review reported zero Critical, Important, or Minor findings. The local worktree can compile the affected Go tests but cannot execute them with the required Milvus dynamic-library RPATH, so behavioral evidence is explicitly attributed to `mini` rather than to the local machine.
 
@@ -432,7 +433,7 @@ Scheduler inspection and epoch carry-over use the concrete merge implemented by 
 
 There is no action union and there are no retry, quarantine, ambiguity, or reservation fields inside `PendingBalanceTaskSnapshot`. Those concerns are separate manager-owned `EpochPlanningConstraints`. If a scheduler task has disappeared but the manager still owns an ambiguous object, `pendingCarryOver` synthesizes its Grow and Reduce actions, allowing the anonymous or task-ID record to remain visible to the next snapshot. Object locks and node charges remain keyed by replica-scoped `BalanceObjectKey`, so later planning cannot reuse that uncertain object.
 
-The object lock and reservation are owned by `BalanceEpochManager`, not by the current scheduler task record. Today, an RPC error can make the scheduler fail and remove a task, which also removes its scheduler dedup index and task delta. Epoch safety therefore cannot depend on that scheduler entry surviving. The epoch-owned record remains until distribution resolves the outcome, even if the underlying scheduler task has already been removed.
+The object lock and reservation are owned by `BalanceEpochManager`, not by the current scheduler task record. A raw error returned after RPC dispatch can make the scheduler fail and remove a task even though the remote side effect is still unknown; removal also drops the scheduler dedup index and task delta. Epoch safety therefore cannot depend on that scheduler entry surviving. The executor preserves this case as a typed `AmbiguousExecutionError`, and the epoch-owned record remains until distribution resolves the outcome even after the scheduler task disappears.
 
 In the MVP, a capacity reservation consists of scheduler task slots plus the row/count or channel-count workload effects understood by the configured current policy. This MEP does not claim exact byte-level admission. A future resource-aware planner may extend the same structure with memory, disk, GPU, and loading-byte reservations.
 
@@ -767,15 +768,27 @@ The following invariants must be preserved:
 5. An action with an ambiguous RPC outcome remains locked until distribution reconciliation.
 6. The epoch planner never mutates distribution or manufactures pending-task deltas.
 
-The implementation does not introduce an executor-stage or RPC-outcome interface. It observes only the existing synchronized task surface—`Task.Done()`, `Task.Status()`, and `Task.Err()`—together with authoritative segment/channel distribution. This keeps the epoch independent from the scheduler's mutable action step.
+The implementation adds typed outcome markers at the existing session and executor boundaries without coupling the epoch manager to the mutable executor action step.
+
+`session.QueryCluster.send` is the boundary that knows whether the QueryNode client callback was invoked. For the four balance RPCs—`LoadSegments`, `ReleaseSegments`, `WatchDmChannels`, and `UnsubDmChannel`—a failure returned before callback invocation is wrapped with `session.NewRPCNotSentError`. The wrapper preserves the original cause through `Unwrap`; because the request was not dispatched, this is a definitive local failure.
+
+After dispatch, `task.checkBalanceRPCCall` applies one rule to Segment Grow/Reduce and Channel Grow/Reduce:
+
+- an `RPCNotSentError` stays definitive;
+- a raw Go/gRPC error after dispatch is wrapped with `task.NewAmbiguousExecutionError`, because QueryNode may have applied the operation before the response was lost; and
+- an explicit non-OK protobuf status returned without a raw transport error is definitive, because QueryNode returned an application response.
+
+The epoch manager still observes only `Task.Done()`, `Task.Status()`, `Task.Err()`, and authoritative Segment/Channel distribution. `Task.Fail` stores the plain task error before closing `Done`. Reconciliation first observes the closed channel and only then calls `Task.Err()`, so the channel close establishes the happens-before edge for that error read. A `Failed` status visible before `Done` closes is treated as ambiguous instead of reading an unsynchronized error or declaring a definitive Grow/Reduce failure.
 
 Classification is deliberately conservative:
 
 - target present and ready while source is absent is completed regardless of the task label;
 - `Started` or `Canceled` with any other placement is ambiguous carry-over;
-- `Failed` with source present and target absent is a known Grow failure;
-- `Failed` with both copies present is a known Reduce failure;
-- `Failed` with neither copy present is lost placement and therefore degraded; and
+- `Failed` before `Done` closes is ambiguous carry-over;
+- a completed `Failed` task with `AmbiguousExecutionError` is ambiguous carry-over for every non-desired placement;
+- a completed definitive `Failed` task with source present and target absent is a known Grow failure;
+- a completed definitive `Failed` task with both copies present is a known Reduce failure;
+- a completed definitive `Failed` task with neither copy present is lost placement and therefore degraded; and
 - `Succeeded` without the desired authoritative placement is still ambiguous.
 
 For a channel, target readiness additionally requires a serviceable target record, a nonzero leader equal to the target node, and a leader target version at least as new as the frozen Current-target version. Task terminality or RPC success never substitutes for placement readiness.
@@ -942,15 +955,16 @@ The result determines `Completed`, `Degraded`, `Superseded`, or `TimedOut`. A st
 
 Reconciliation applies this ordered placement/status matrix:
 
-| Precedence | Task status | Target/source presence | Classification and outcome |
+| Precedence | Task observation | Target/source presence | Classification and outcome |
 |---:|---|---|---|
-| 1 | Any | Ready target present, source absent | Completed; clear retry history and release the object constraint. |
-| 2 | `Started` or `Canceled` | Any other placement | Ambiguous carry-over; keep object lock and charge both positive source/target endpoints. |
-| 3 | `Failed` | Target absent, source present | Known Grow failure; retain source, record retry history, finish degraded. |
-| 4 | `Failed` | Target present, source present | Known Reduce failure/redundant copy; record retry history, finish degraded, and let existing cleanup logic resolve the extra copy. |
-| 5 | `Failed` | Target absent, source absent | Lost placement; record retry history and force `Degraded`, even if the prior intent was timeout or supersession. |
-| 6 | `Failed` | Target present, source absent but target not ready | Ambiguous until target readiness becomes authoritative. |
-| 7 | `Succeeded` or any other status | Desired placement not observed | Ambiguous carry-over; task success alone is not authoritative. |
+| 1 | Any status or error | Ready target present, source absent | Completed; desired authoritative placement wins, retry history is cleared, and the object constraint is released. |
+| 2 | `Started`, `Canceled`, or `Failed` before `Done` is observed closed | Any other placement | Ambiguous carry-over; keep the object lock and charge both positive source/target endpoints. |
+| 3 | Completed `Failed` task with `AmbiguousExecutionError` | Any non-desired placement | Ambiguous carry-over; a post-dispatch raw error is not proof of the remote side effect. |
+| 4 | Completed definitive `Failed` task | Target absent, source present | Known Grow failure; retain source, record retry history, finish degraded. |
+| 5 | Completed definitive `Failed` task | Target present, source present | Known Reduce failure/redundant copy; record retry history, finish degraded, and let existing cleanup logic resolve the extra copy. |
+| 6 | Completed definitive `Failed` task | Target absent, source absent | Lost placement; record retry history and force `Degraded`, even if the prior intent was timeout or supersession. |
+| 7 | Completed definitive `Failed` task | Target present, source absent but target not ready | Ambiguous until target readiness becomes authoritative. |
+| 8 | `Succeeded` or any other status | Desired placement not observed | Ambiguous carry-over; task success alone is not authoritative. |
 
 Only accepted scheduler admissions enter this table. Rejected plans release their provisional wave reservation immediately and do not increment admitted-task accounting.
 
@@ -969,7 +983,7 @@ When the deadline expires:
 
 Terminal precedence is based on final observed state. If a deadline intent exists but every object reaches desired placement with no known failure or carry, reconciliation upgrades the result to `Completed`. Lost placement always forces `Degraded`. Otherwise unresolved carry retains `TimedOut`, while a superseding topology/target intent remains `Superseded`.
 
-An in-flight Grow is not followed by Reduce unless target presence is confirmed. Only a definitive terminal Reduce failure can be classified as a redundant copy. Cancelled, deadline, unavailable, or lost-response Reduce remains ambiguous and carries its lock/reservation until later distribution proves the result. The next epoch may plan unrelated objects while this object remains locked.
+An in-flight Grow is not followed by Reduce unless target presence is confirmed. Only a definitive terminal Reduce failure can be classified as a redundant copy. A cancelled task or raw post-dispatch deadline, unavailable, or lost-response Reduce remains ambiguous and carries its lock/reservation until later distribution proves the result. A pre-dispatch `RPCNotSentError` or explicit non-OK response remains definitive. The next epoch may plan unrelated objects while this object remains locked.
 
 ### Scoped invalidation matrix
 
@@ -986,7 +1000,8 @@ Runtime changes do not all invalidate the same scope:
 | Independent recovery task changes pending work | During admission, the effective pending revision rejects the remaining suffix. During execution, `StaleEpoch` is ignored and authoritative placement/task state owns reconciliation. The MVP has no same-tick recovery preemption signal. |
 | Unrelated or same-RG placement publication without topology/target change | Do not automatically abort execution; ordinary `PlacementHash` changes are feedback, not supersession. |
 | QueryNode resource exhausted | Stop remaining admission, reconcile accepted work, and rebuild the next generation with updated node eligibility/penalty. |
-| RPC timeout or temporary unavailable | Keep the object locked and reconcile/retry within its bounded policy; do not automatically invalidate unrelated plans. |
+| Raw post-dispatch RPC timeout or temporary unavailable | Keep the object locked and reconcile within its bounded policy; do not automatically invalidate unrelated plans. |
+| Pre-dispatch `RPCNotSentError` or explicit non-OK QueryNode status | Treat as a definitive task failure and apply the placement-specific Grow/Reduce classification. |
 | Source resource disappeared | Mark the plan stale and reconcile that object. |
 | `LeaderHash` changed before admission | Reject admission as `leader_missing` and stop the suffix as superseded. |
 | Leader publication after admission | Do not supersede execution, including publication for an unrelated collection; channel handoff itself changes leader state. Reconcile using target readiness and task outcome. |
@@ -1000,7 +1015,7 @@ Epochs are not transactions. A successfully completed move is not rolled back be
 
 #### Grow/load failure
 
-If Grow fails and the target is absent from distribution:
+If Grow has a definitive failure and the target is absent from distribution:
 
 - keep the source copy;
 - mark the task failed;
@@ -1008,13 +1023,13 @@ If Grow fails and the target is absent from distribution:
 - retain the task error and increment epoch-level object retry history; existing scheduler/node resource-exhaustion penalties remain unchanged; and
 - allow independent tasks in the epoch to continue.
 
-The next epoch may choose a different target. Repeated failures trigger the existing node resource-exhaustion penalty when applicable and the quarantine policy below.
+Definitive failures include an `RPCNotSentError` from before dispatch and an explicit non-OK QueryNode application status. The next epoch may choose a different target. Repeated failures trigger the existing node resource-exhaustion penalty when applicable and the quarantine policy below.
 
 #### No-progress handling and quarantine
 
 The epoch layer must prevent one permanently failing object from monopolizing the RG control loop.
 
-- The first implementation does not add in-place scheduler action retries. An RPC failure terminates the scheduler task according to current behavior.
+- The first implementation does not add in-place scheduler action retries. Both definitive and ambiguous RPC errors terminate the scheduler task according to current behavior; typed outcome plus authoritative placement determines whether the epoch releases or carries the object.
 - Epoch reconciliation classifies the result and a later generation may admit a newly planned task if the preconditions still make sense.
 - Each object has a bounded number of consecutive known epoch-level failures before quarantine; attempts below the threshold are retained as retry history but are not delayed by a separate per-attempt backoff.
 - The no-progress deadline sets a timeout intent and forces reconciliation. It does not by itself quarantine an ambiguous object.
@@ -1026,15 +1041,16 @@ Quarantine is a control-loop decision, not a declaration that the segment may be
 
 #### Ambiguous Grow outcome
 
-If the Grow RPC times out or loses its response, the task must not immediately retry or replan the segment. Reconciliation checks target distribution:
+If a dispatched Grow RPC returns a raw timeout, `Unavailable`, or another transport error, the executor wraps it as `AmbiguousExecutionError`. The task must not immediately retry or replan the segment. Reconciliation checks target distribution:
 
-- target present: treat Grow as successful and continue or repair Reduce;
+- ready target present and source absent: desired placement wins even if the task carries an ambiguous error;
+- target present with source retained: desired placement is not reached, so keep the handoff locked as ambiguous carry-over until authoritative source disappearance completes it;
 - Grow has a definitive terminal failure, target absent, source present: treat Grow as failed and release the destination reservation; and
-- task not terminal or Grow outcome is transport-ambiguous with target absent: keep the object lock and conservative reservation as ambiguous carry-over. Absence at one observation point is not proof that an already-dispatched Grow cannot still become visible.
+- task not terminal, `Failed` not yet synchronized through `Done`, or completed Grow outcome is typed ambiguous with target absent: keep the object lock and conservative reservation as ambiguous carry-over. Absence at one observation point is not proof that an already-dispatched Grow cannot still become visible.
 
 #### Reduce failure
 
-If target presence was confirmed and Reduce has a definitive terminal failure, the segment may exist on both source and target. This is availability-safe but consumes extra resources. A non-terminal, cancelled, timed-out, unavailable, or lost-response Reduce is not classified here; it remains ambiguous.
+If target presence was confirmed and Reduce has a definitive terminal failure, the segment may exist on both source and target. This is availability-safe but consumes extra resources. A non-terminal or cancelled Reduce remains ambiguous. A raw post-dispatch timeout, `Unavailable`, or lost-response error is typed ambiguous even after the task fails; it retains the lock and both node charges until authoritative source disappearance completes the move. An `RPCNotSentError` or explicit non-OK QueryNode status remains definitive.
 
 The epoch records a partial completion and ends as `Degraded` after reconciliation. The MVP does not add a standalone cleanup plan type: existing target/availability checkers decide which copy to remove. Normal epoch policy keeps the object locked for the current handoff and must not generate a reverse move merely because Reduce failed.
 
@@ -1134,11 +1150,21 @@ Responsibilities:
 - determines the terminal epoch state; and
 - produces the authoritative input boundary for the next epoch.
 
+#### Balance RPC outcome markers
+
+Responsibilities:
+
+- marks failures known to occur before QueryNode RPC dispatch as `RPCNotSentError` at the session boundary;
+- marks raw post-dispatch transport/gRPC errors as `AmbiguousExecutionError` at the balance executor boundary;
+- keeps explicit non-OK QueryNode application statuses definitive; and
+- preserves original causes through `Unwrap` for diagnostics and existing error handling.
+
 ### Delivery map
 
 | MEP component | Milvus package/file |
 |---|---|
 | Epoch/task identity, typed admission, pending generations, task completion | `internal/querycoordv2/task/balance_admission.go`, `task.go`, `scheduler.go` |
+| Balance RPC dispatch and execution outcome typing | `internal/querycoordv2/session/rpc_outcome.go`, `cluster.go`, `internal/querycoordv2/task/execution_outcome.go`, `executor.go` |
 | Atomic QueryNode segment/channel publication and capture | `internal/querycoordv2/meta/dist_manager.go`, `segment_dist_manager.go`, `channel_dist_manager.go`, `internal/querycoordv2/dist/dist_handler.go` |
 | Immutable placement snapshot and admission validation | `internal/querycoordv2/balance/epoch_types.go`, `epoch_snapshot.go` |
 | Hard wave budget, object locks, projected apply/undo | `internal/querycoordv2/balance/epoch_wave.go` |
@@ -1282,49 +1308,39 @@ Mixed-version QueryNode deployments are supported because the first version of t
 
 ### Verified implementation evidence
 
-Behavioral tests were run at final implementation commit `b454240dc680a7c02c676e1c377ebaac1732dff5` on the approved `mini` macOS development host. Every accepted run sourced `scripts/setenv.sh`, supplied the repository native-library RPATH, used a fresh isolated no-auth etcd/local-storage directory, preserved the direct Go test exit code, and verified process, port, and data-directory cleanup.
+Behavioral tests were run at final implementation commit `5db539d20c4787087386b33347191083a07b9d3c` on the approved `mini` macOS development host. Every accepted run sourced `scripts/setenv.sh`, supplied the repository native-library RPATH, used a fresh isolated no-auth etcd/local-storage directory, preserved the direct Go test exit code, and verified process, port, and data-directory cleanup.
 
 The final focused selectors were:
 
 ```bash
 go test -timeout 120s -gcflags="all=-N -l" -ldflags="-r ${RPATH}" -tags dynamic,test \
+  ./internal/querycoordv2/session \
+  -run 'TestClusterSuite/TestBalanceRPCPreDispatchErrorsAreMarkedNotSent' -count=1
+
+go test -timeout 120s -gcflags="all=-N -l" -ldflags="-r ${RPATH}" -tags dynamic,test \
   ./internal/querycoordv2/task \
-  -run 'TestTask/(TestChannelTaskDeltaSnapshot|TestAdmitBalanceTask|TestTaskDone)' -count=1
+  -run 'TestTask/(TestExecutorRaw.*ErrorIsAmbiguous|TestExecutorRPCNotSentReleaseErrorIsDefinitive|TestExecutorNonOKReleaseStatusIsDefinitive)' -count=1
 
 go test -timeout 120s -gcflags="all=-N -l" -ldflags="-r ${RPATH}" -tags dynamic,test \
   ./internal/querycoordv2/balance \
-  -run 'Test(PlacementSnapshot|WaveLedger|ProjectedPlacement|ScoreEpochPolicy|ChannelLevelEpochPolicy|EpochManager|BalanceEpoch)' -count=1
-
-go test -timeout 120s -gcflags="all=-N -l" -ldflags="-r ${RPATH}" -tags dynamic,test \
-  ./internal/querycoordv2/checkers \
-  -run 'TestBalanceChecker|TestCheckControllerSuite' -count=1
-
-cd pkg
-go test ./util/paramtable -run 'TestComponentParam_BalanceEpoch' -count=1
-go test ./metrics -run 'TestQueryCoordBalanceEpochMetrics' -count=1
+  -run 'Test(EpochManagerAmbiguousRPCFailureRetainsReservationsUntilAuthoritativePlacementSettles|EpochManagerFailedStatusBeforeDoneIsAmbiguous)' -count=1
 ```
 
 The exact accepted package results were:
 
 ```text
-FOCUSED_PREFLIGHT_PORTS_CLEAR=1
-FOCUSED_ETCD_HEALTHY=1
-ok  github.com/milvus-io/milvus/internal/querycoordv2/task      0.838s
-FOCUSED_TASK_EXIT=0
-ok  github.com/milvus-io/milvus/internal/querycoordv2/balance   0.847s
-FOCUSED_BALANCE_EXIT=0
-ok  github.com/milvus-io/milvus/internal/querycoordv2/checkers  1.299s
-FOCUSED_CHECKERS_EXIT=0
-ok  github.com/milvus-io/milvus/pkg/v3/util/paramtable          0.317s
-FOCUSED_PARAMTABLE_EXIT=0
-ok  github.com/milvus-io/milvus/pkg/v3/metrics                  0.264s
-FOCUSED_METRICS_EXIT=0
-FOCUSED_PROCESS_CLEAR=1
-FOCUSED_PORTS_CLEAR=1
-FOCUSED_DATA_CLEAR=1
+ok  github.com/milvus-io/milvus/internal/querycoordv2/session  0.738s
+SESSION_FOCUSED_EXIT=0
+ok  github.com/milvus-io/milvus/internal/querycoordv2/task     0.806s
+TASK_FOCUSED_EXIT=0
+ok  github.com/milvus-io/milvus/internal/querycoordv2/balance  0.744s
+BALANCE_FOCUSED_EXIT=0
+GREEN2_PROCESS_CLEAR=1
+GREEN2_PORTS_CLEAR=1
+GREEN2_DATA_CLEAR=1
 ```
 
-The focused remote wrapper exited `0`. The `pkg` commands are run from the nested `pkg` Go module; the superficially similar root-module paths are invalid and are not counted as test evidence.
+The focused wrappers exited `0`. Earlier implementation gates also covered `BalanceChecker`, all ten refreshable configuration keys, and all eight metric collectors; commit `5db539d20c` changes only the session/task/balance RPC-outcome boundary, so the final focused run targets that changed correctness surface and the final whole-QueryCoord run covers the complete internal component tree.
 
 The final complete QueryCoord command was:
 
@@ -1337,28 +1353,44 @@ go test -timeout 300s -gcflags="all=-N -l" -ldflags="-r ${RPATH}" \
 The exact accepted output was:
 
 ```text
-FULL_PREFLIGHT_PORTS_CLEAR=1
 FULL_ETCD_HEALTHY=1
-ok  github.com/milvus-io/milvus/internal/querycoordv2            107.713s
-ok  github.com/milvus-io/milvus/internal/querycoordv2/assign       3.707s
-ok  github.com/milvus-io/milvus/internal/querycoordv2/balance      2.688s
-ok  github.com/milvus-io/milvus/internal/querycoordv2/checkers     5.780s
-ok  github.com/milvus-io/milvus/internal/querycoordv2/dist        16.654s
-ok  github.com/milvus-io/milvus/internal/querycoordv2/job          5.654s
-ok  github.com/milvus-io/milvus/internal/querycoordv2/meta        14.320s
+ok  github.com/milvus-io/milvus/internal/querycoordv2            107.377s
+ok  github.com/milvus-io/milvus/internal/querycoordv2/assign       2.032s
+ok  github.com/milvus-io/milvus/internal/querycoordv2/balance      2.682s
+ok  github.com/milvus-io/milvus/internal/querycoordv2/checkers     5.825s
+ok  github.com/milvus-io/milvus/internal/querycoordv2/dist        16.672s
+ok  github.com/milvus-io/milvus/internal/querycoordv2/job          3.991s
+ok  github.com/milvus-io/milvus/internal/querycoordv2/meta        14.709s
 ?   github.com/milvus-io/milvus/internal/querycoordv2/mocks       [no test files]
-ok  github.com/milvus-io/milvus/internal/querycoordv2/observers   30.964s
+ok  github.com/milvus-io/milvus/internal/querycoordv2/observers   27.465s
 ?   github.com/milvus-io/milvus/internal/querycoordv2/params      [no test files]
-ok  github.com/milvus-io/milvus/internal/querycoordv2/session      2.057s
-ok  github.com/milvus-io/milvus/internal/querycoordv2/task        21.461s
-ok  github.com/milvus-io/milvus/internal/querycoordv2/utils        4.422s
+ok  github.com/milvus-io/milvus/internal/querycoordv2/session      2.835s
+ok  github.com/milvus-io/milvus/internal/querycoordv2/task        21.580s
+ok  github.com/milvus-io/milvus/internal/querycoordv2/utils        3.534s
 FULL_QUERYCOORD_EXIT=0
 FULL_PROCESS_CLEAR=1
 FULL_PORTS_CLEAR=1
 FULL_DATA_CLEAR=1
 ```
 
-The remote wrapper also exited `0`. An independent follow-up scan after both focused and full wrappers confirmed `FOLLOWUP_PROCESS_CLEAR=1`, `FOLLOWUP_PORTS_CLEAR=1`, and `FOLLOWUP_DATA_CLEAR=1`. Local `gofmt` over all 32 branch-modified Go files produced no diff, and `git diff --check` exited `0`.
+The remote wrapper also exited `0`.
+
+The two focused balance regressions were also run with the Go race detector:
+
+```bash
+go test -race -tags dynamic,test ./internal/querycoordv2/balance \
+  -run 'Test(EpochManagerAmbiguousRPCFailureRetainsReservationsUntilAuthoritativePlacementSettles|EpochManagerFailedStatusBeforeDoneIsAmbiguous)' -count=1
+```
+
+```text
+ok  github.com/milvus-io/milvus/internal/querycoordv2/balance  1.975s
+RACE_BALANCE_EXIT=0
+RACE_PROCESS_CLEAR=1
+RACE_PORTS_CLEAR=1
+RACE_DATA_CLEAR=1
+```
+
+Local `gofmt` over all 37 branch-modified Go files produced no diff, `git diff --check` exited `0`, and the final DCO audit found 19 commits with 19 `Signed-off-by` lines.
 
 ### #51244 static-target convergence fixture
 
@@ -1401,16 +1433,22 @@ Five companion fixtures prove delayed Grow locking, successful-prefix retention 
 - `Converged` uses the same strict potential comparison as wave admission.
 - Duplicate and stale plans are rejected without corrupting reservations.
 - Epoch deadline transitions through reconciliation before `TimedOut`.
+- Pre-dispatch failures for all four balance RPCs are marked `RPCNotSentError`, preserve their original causes, and remain definitive.
+- Raw post-dispatch errors for Segment Grow/Reduce and Channel Grow/Reduce are marked `AmbiguousExecutionError`; explicit non-OK QueryNode statuses and RPC-not-sent errors remain definitive.
+- `Task.Err()` is read only after `Done` is observed closed; a `Failed` status observed before that synchronization point remains ambiguous.
+- Real scheduler/executor task completion preserves the typed error through the `Done`/`Err` surface consumed by epoch reconciliation.
 
 ### State-machine tests
 
 - No-plan snapshot finishes as `Completed/Converged`.
 - All tasks succeed and distribution matches: `Completed`.
 - Grow fails before target presence: source remains and epoch becomes `Degraded`.
-- Grow RPC times out but target later appears: reconciliation recognizes success.
+- A raw post-dispatch Grow RPC times out but target later appears: reconciliation recognizes success.
 - Reduce fails after target presence: redundant copy remains and epoch becomes `Degraded`.
-- Cancelled, timed-out, unavailable, or lost-response Reduce with source+target both present remains locked; a delayed source disappearance later reconciles as completed.
+- Cancelled or raw post-dispatch timed-out, unavailable, or lost-response Reduce with source+target both present remains locked; a delayed source disappearance later reconciles as completed.
 - Ambiguous Reduce with both source and target absent remains locked for normal balance while availability repair proceeds; it is not misclassified as a definitive missing-placement quarantine.
+- A completed failed task with `AmbiguousExecutionError` remains locked and keeps both charged-node reservations for Segment/Channel Grow/Reduce until authoritative placement settles.
+- Desired target-only placement completes even when the scheduler task retains an ambiguous post-dispatch error.
 - Node failure and RG membership change supersede the RG generation.
 - A collection target, replica, node-eligibility, or pre-admission leader change stops the remaining suffix and transitions through reconciliation.
 - Execution tolerates `StaleEpoch` and post-admission leader publication while RG/node/replica/target invalidation still supersedes.
@@ -1428,6 +1466,7 @@ Five companion fixtures prove delayed Grow locking, successful-prefix retention 
 - Distribution pull delay between Grow and Reduce does not create a reverse move for the same segment.
 - One failed task does not roll back unrelated successful moves.
 - One RG's stuck or failed epoch does not block another RG.
+- Ambiguous post-dispatch failures cannot admit a duplicate or reverse move for the same replica-scoped object; delayed authoritative Grow/Reduce publication releases the carry only after target-only placement is observed.
 - Shadow mode produces snapshot/plan/objective metrics, performs zero typed admissions, installs no locks/reservations/runtime state, and leaves legacy normal balance enabled when no active generation is draining.
 
 The issue-#51244 static-target fixture records every `(replica, object, from, to)` admission across repeated checker ticks and asserts:
@@ -1444,7 +1483,6 @@ The issue-#51244 static-target fixture records every `(replica, object, from, to
 - Repeated QueryNode restarts and shard-leader changes while normal balance is active.
 - RG scale-out and scale-in near balance trigger boundaries.
 - Object-storage load failures and resource-exhaustion responses.
-- Lost RPC responses where QueryNode applies the operation successfully.
 - A production-scale distribution modeled after issue #51244, beyond the deterministic retained fixture, verifying bounded in-flight work and the absence of repeated reverse moves under a static target.
 - QueryCoord process restart during active execution, verifying that recovered distribution—not in-memory epoch state—drives the next plan.
 
@@ -1456,6 +1494,9 @@ Focused task, balance, checker, configuration, and metric tests run first with s
 source scripts/setenv.sh
 go test -timeout 300s -gcflags="all=-N -l" -ldflags="-r ${RPATH}" -tags dynamic,test \
   ./internal/querycoordv2/... -count=1
+
+go test -race -tags dynamic,test ./internal/querycoordv2/balance \
+  -run 'Test(EpochManagerAmbiguousRPCFailureRetainsReservationsUntilAuthoritativePlacementSettles|EpochManagerFailedStatusBeforeDoneIsAmbiguous)' -count=1
 
 git diff --check 4dbaba0042d3952fa75bbb5d2fb9606c6b67f44d...HEAD
 ```
