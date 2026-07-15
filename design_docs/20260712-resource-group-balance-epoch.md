@@ -1,11 +1,15 @@
 # MEP: Resource-Group Balance Epoch
 
 - **Created:** 2026-07-12
+- **Last Updated:** 2026-07-15
 - **Author(s):** @xiaofanluan
 - **Status:** Draft
 - **Component:** Coordinator
 - **Related Issues:** [milvus-io/milvus#51244](https://github.com/milvus-io/milvus/issues/51244)
 - **Related Pull Requests:** [milvus-io/milvus#49861](https://github.com/milvus-io/milvus/pull/49861), [milvus-io/milvus#50774](https://github.com/milvus-io/milvus/pull/50774)
+- **Implementation Baseline:** `milvus-io/milvus@4dbaba0042d3952fa75bbb5d2fb9606c6b67f44d`
+- **Implementation Branch:** `xiaofanluan/milvus:feature/resource-group-balance-epoch` at `6b3c870d30efa660955b0a1b1c3806c310d34728`
+- **Implementation Pull Request:** The draft Milvus PR will be opened after the design-doc PR so the implementation can link the published MEP; this line will be updated with that URL in a follow-up design-doc commit.
 - **Released:** Not released
 
 ## Summary
@@ -14,7 +18,7 @@ This MEP introduces a resource-group-scoped balance epoch for QueryCoord.
 
 Today, QueryCoord periodically generates balance plans collection by collection and submits them directly to the task scheduler. A later checker iteration can plan again while an earlier set of Grow and Reduce actions is still being executed or has only partially appeared in QueryNode distribution. Scheduler task deltas reduce this problem, but they do not provide a consistent planning snapshot, a bounded planning wave, or a clear boundary between acting and observing.
 
-The proposed control loop is:
+The implemented control loop is:
 
 ```text
 Observe -> Plan -> Admit -> Execute -> Reconcile -> Observe again
@@ -30,15 +34,34 @@ Each Resource Group (RG) is an independent balance group and may have at most on
 6. ends as completed, degraded, superseded, or timed out; and
 7. allows the next epoch to plan unrelated objects from a newly reconciled snapshot.
 
-Different RGs can run epochs concurrently. Stopping balance and failure recovery have higher priority and may invalidate or preempt a normal epoch.
+Different RGs can run epochs concurrently. Stopping balance and failure recovery retain higher priority and stay on legacy paths in the MVP. The stopping path inside `BalanceChecker` prevents a new normal epoch in the same tick. Independent recovery checkers are coordinated conservatively through pending snapshots, scheduler deduplication, stale admission, and later reconciliation rather than a common preemption signal.
 
 This MEP changes the orchestration and correctness boundary of balancing. It does not define a new resource-aware scoring function, shard placement policy, or migration-cost model. Those policies can be implemented separately on top of the snapshot and epoch interfaces defined here.
+
+## Implementation Status
+
+The MVP described by this MEP is implemented and reviewed on the Milvus feature branch. Relative to baseline `4dbaba0042d3952fa75bbb5d2fb9606c6b67f44d`, final implementation commit `6b3c870d30efa660955b0a1b1c3806c310d34728` contains 18 feature commits and changes 33 files. Active rollout remains disabled by default, and the implementation PR has not yet been opened because delivery follows the design-first sequence described below.
+
+| Layer | Status | Milvus commits | Main files |
+|---|---|---|---|
+| Task completion and distribution-aware pending effects | Implemented and reviewed | `6bf9b84c15` | `task/task.go`, `task/scheduler.go` |
+| Typed and generation-aware held admission | Implemented and reviewed | `168a6f437e`, `b6c50586bf` | `task/balance_admission.go`, `task/scheduler.go` |
+| Atomic distribution publication and immutable RG snapshots | Implemented and reviewed | `b39d2070d6` through `0d89d9c141` | `meta/dist_manager.go`, `dist/dist_handler.go`, `balance/epoch_types.go`, `balance/epoch_snapshot.go` |
+| Hard wave budgets, immutable reservations, and projected placement | Implemented and reviewed | `95d9b604fb`, `15f66b47d1` | `balance/epoch_wave.go` |
+| Snapshot-only ScoreBased and ChannelLevel policy | Implemented and reviewed | `b3569f955a` | `balance/epoch_score_policy.go`, `balance/balancer_factory.go` |
+| Tick-driven per-RG epoch state machine | Implemented and reviewed | `47e5ceb6da` through `b5e1640695` | `balance/epoch_manager.go` |
+| `BalanceChecker` integration | Implemented and reviewed | `48b82c12e6` | `checkers/balance_checker.go` |
+| Dynamic rollout configuration | Implemented and reviewed | `6a8e358263` | `configs/milvus.yaml`, `pkg/util/paramtable/component_param.go` |
+| Metrics, shadow mode, and retained-state observation | Implemented and reviewed | `532e6f4908`, `46b797085b` | `pkg/metrics/querycoord_metrics.go`, checker and manager files |
+| #51244 convergence and failure fixtures | Implemented and reviewed | `6b3c870d30` | `balance/epoch_manager_test.go` |
+
+The final full `internal/querycoordv2/...` run is green on the approved `mini` macOS development host with the repository native-library RPATH and isolated temporary etcd. The final task review reported zero Critical, Important, or Minor findings. The local worktree can compile the affected Go tests but cannot execute them with the required Milvus dynamic-library RPATH, so behavioral evidence is explicitly attributed to `mini` rather than to the local machine.
 
 ## Motivation
 
 ### Current behavior
 
-As of Milvus master commit `158b1dc38a962837dfed1a36925e3d00910342be`:
+The implementation was rebased from Milvus master commit `4dbaba0042d3952fa75bbb5d2fb9606c6b67f44d`:
 
 - `BalanceChecker` periodically selects collections and replicas, invokes the configured balancer, converts plans to tasks, and calls `Scheduler.Add` directly.
 - Stopping balance has priority over normal balance.
@@ -93,9 +116,10 @@ This MEP has the following goals:
 6. Define deterministic epoch behavior for task failure, ambiguous RPC outcomes, node failure, target changes, and RG topology changes.
 7. Preserve the existing Grow-before-Reduce availability invariant.
 8. Allow different RGs to balance independently and concurrently.
-9. Allow stopping balance and recovery to preempt normal balancing.
+9. Preserve stopping-balance and recovery priority while keeping their admission path outside the MVP epoch controller.
 10. Prevent one permanently slow or bad object from blocking unrelated objects in the same RG.
 11. Provide metrics that distinguish planning, admission, execution, distribution waiting, reconciliation, and convergence.
+12. Preserve legacy behavior when the epoch feature is disabled or the configured balancer has no snapshot-backed epoch policy.
 
 ### Non-goals
 
@@ -106,8 +130,14 @@ This MEP does not:
 - define small-cluster versus shard-local placement;
 - optimize migration byte cost;
 - make a balance wave transactional or roll back all successful moves after one task fails;
-- persist an in-progress epoch across QueryCoord restart; or
-- serialize unrelated RGs behind a cluster-global balance lock.
+- persist an in-progress epoch across QueryCoord restart;
+- serialize unrelated RGs behind a cluster-global balance lock;
+- add scheduler action retries;
+- add reverse-move cooldown;
+- add byte-level migration admission in the MVP; or
+- route stopping/recovery work through the typed epoch admission gateway in the MVP.
+
+Stopping balance and recovery remain on their existing higher-priority paths in the first implementation. Stopping work admitted by `BalanceChecker` prevents new normal work in that tick. Independently scheduled recovery may race with normal admission; pending-snapshot validation, scheduler deduplication, and reconciliation preserve safety. Common recovery admission classes and epoch-scoped preemption are follow-up work.
 
 ## Terminology
 
@@ -199,70 +229,146 @@ Moving a node between RGs or moving a replica to another RG is a topology operat
 
 ### Epoch identity
 
-An epoch ID is scoped to the RG and the current QueryCoord leader term:
+Task attribution uses the implemented `task.BalanceEpochMeta` value:
 
 ```go
-type BalanceEpochID struct {
+type BalanceEpochMeta struct {
     ResourceGroup string
     LeaderTerm    uint64
     Sequence      uint64
 }
 ```
 
-`LeaderTerm` may be implemented as the QueryCoord leadership term or a unique process boot ID. It prevents a delayed completion callback from an old QueryCoord leader from mutating a new leader's epoch. The sequence is used for task attribution, stale-event rejection, logs, and metrics. Neither field replaces distribution, target, or topology versions.
+`LeaderTerm` is a process-boot identifier in the MVP, derived once when `BalanceEpochManager` is created. Tests may inject a fixed value. It prevents an old in-process completion from being attributed to a new manager instance. The manager keeps a monotonic next-sequence counter per RG for its full process lifetime, even after an idle runtime is removed, so `(ResourceGroup, LeaderTerm, Sequence)` is not reused. Neither field replaces distribution, target, or topology versions.
 
 ### Placement snapshot
 
-The planner consumes one immutable snapshot:
+The planner consumes one immutable, value-only `PlacementSnapshot`. The implemented token separates the identity of topology and desired state from the ordinary distribution revisions that the epoch itself is expected to advance:
 
 ```go
+type SnapshotToken struct {
+    ResourceGroup         string
+    RGHash                uint64
+    ReplicaHash           uint64
+    NodeHash              uint64
+    LeaderHash            uint64
+    PlacementHash         uint64
+    SegmentRevision       int64 // global diagnostic only
+    ChannelRevision       int64 // global diagnostic only
+    PendingTaskRevision   uint64 // RG-scoped absolute revision
+    PendingGlobalRevision uint64 // diagnostic only
+    CurrentTargetVersion  map[int64]int64
+    NextTargetVersion     map[int64]int64
+}
+
+type AdmissionToken struct {
+    Snapshot           SnapshotToken
+    Epoch              task.BalanceEpochMeta
+    CollectionID       int64
+    ReplicaID          int64
+    ExpectedSourceNode int64
+    Segment            *SegmentObjectKey
+    Channel            *ChannelObjectKey
+}
+
 type PlacementSnapshot struct {
-    ResourceGroup string
-    LeaderTerm    uint64
-
-    RGSegmentRevision  uint64
-    RGChannelRevision  uint64
-    TargetVersions     map[int64]int64
-    ReplicaVersions    map[int64]int64
-    RGVersion          uint64
-
-    Nodes       map[int64]NodeSnapshot
-    Replicas    map[int64]ReplicaSnapshot
-    Segments    map[SegmentObjectKey]SegmentPlacement
-    Channels    map[ChannelObjectKey]ChannelPlacement
-    PendingWork PendingWorkSnapshot
+    Token             SnapshotToken
+    CapturedAt        time.Time
+    Nodes             map[int64]NodeSnapshot
+    Replicas          map[int64]ReplicaSnapshot
+    Segments          map[SegmentObjectKey][]SegmentPlacement
+    Channels          map[ChannelObjectKey][]ChannelPlacement
+    CollectionTargets map[int64]CollectionTargetSnapshot
+    PendingWork       PendingWorkSnapshot
+    EligibleReplicas  map[int64]struct{}
 }
 
 type SegmentObjectKey struct {
     ReplicaID int64
     SegmentID int64
-    Scope     DataScope
+    Scope     querypb.DataScope
 }
 
 type ChannelObjectKey struct {
-    ReplicaID   int64
-    ChannelName string
+    ReplicaID int64
+    Channel   string
 }
 ```
 
-Segment and channel distribution revisions remain separate. The current score cache may use their monotonic sum as a coarse change detector, but an epoch needs the separate values to identify which scoped subsystem changed, validate snapshot capture, and provide useful diagnostics.
+`NodeSnapshot`, `ReplicaSnapshot`, segment/channel placement records, and target records contain primitives only. The snapshot copies RG physical nodes, replica RW/RO/RWSQ/ROSQ nodes, complete channel-to-RW-node mappings, node state/capacity/penalty, scoped segment and channel distribution, leader serviceability and target version, and both Current and Next targets. It never exposes manager-owned protobufs, maps, slices, `Segment`, `DmChannel`, or leader-view objects.
 
-The revisions must be scoped to the RG, or the snapshot builder must compute a stable digest over the distribution records copied into this RG snapshot. Using the current cluster-global distribution version directly would allow unrelated activity in another RG to invalidate this RG repeatedly.
+`SnapshotToken.Equal` compares Resource Group, RG/replica/node/leader/placement hashes, the RG-scoped pending revision, and Current/Next target-version maps. It intentionally ignores the global segment/channel and pending diagnostic revisions. `AdmissionToken.Epoch` binds validation to the generation that owns the plan. `SnapshotToken` privately retains the captured per-epoch pending revisions; `SnapshotToken.PendingRevision(epoch)` returns the RG absolute revision together with the selected epoch revision so generation-aware admission can compare their effective difference. `WithPendingRevision` returns a clone and never mutates the token stored in the planned wave.
 
-The first implementation may construct a snapshot using optimistic version validation:
+The scope contains all workload placed on RG physical nodes or replica outgoing RO/ROSQ nodes, including collections that are not eligible to generate moves in this tick. Workload from unrelated RGs is excluded. In a collection with multiple replicas, an object is associated only with the replica that owns its physical or outgoing node; it is not duplicated across every replica of the collection.
 
-1. read all RG-scoped revision and metadata-version tokens;
-2. copy the required distribution, target, replica, RG, node, and pending-task data;
-3. read all version tokens again; and
-4. accept the snapshot only if every scoped token is unchanged.
+One QueryNode distribution response is published atomically:
 
-If a required manager does not expose a scoped revision, it must add one, provide a digest of the copied records, or participate in a higher-level snapshot lock. The snapshot builder retries when concurrent relevant updates are detected. It must copy manager-owned slices and maps before returning them to the planner.
+```go
+func (dm *DistributionManager) PublishNodeDistribution(
+    nodeID int64,
+    segments []*Segment,
+    channels []*DmChannel,
+) []*DmChannel
+
+func (dm *DistributionManager) RemoveNodeDistribution(nodeID int64)
+func (dm *DistributionManager) Capture() DistributionSnapshot
+```
+
+Segment and channel managers share one publication RW lock. The lock order is always publication lock followed by the manager's internal lock. `distHandler` constructs both halves of a QueryNode response before publishing them, and node removal uses one atomic removal call. A capture therefore observes either the complete old response or the complete new response, never a mixed segment/channel pair.
+
+The snapshot builder has the implemented interface:
+
+```go
+func NewPlacementSnapshotBuilder(
+    metadata *meta.Meta,
+    distribution *meta.DistributionManager,
+    target meta.TargetManagerInterface,
+    nodes *session.NodeManager,
+    inspector task.BalanceTaskInspector,
+    opts ...PlacementSnapshotBuilderOption,
+) *PlacementSnapshotBuilder
+
+func (b *PlacementSnapshotBuilder) Build(
+    ctx context.Context,
+    resourceGroup string,
+    eligibleReplicaIDs []int64,
+    carryOver []task.PendingBalanceTaskSnapshot,
+) (*PlacementSnapshot, error)
+
+func (b *PlacementSnapshotBuilder) Validate(
+    token AdmissionToken,
+) task.BalanceAdmissionReason
+```
+
+`Build` performs at most three optimistic attempts:
+
+1. atomically capture segment/channel distribution;
+2. capture a stable scheduler pending-task snapshot and revision;
+3. copy RG, replica, node, leader, and Current/Next target primitives and compute deterministic FNV digests;
+4. recapture distribution, pending revision, and topology/target digests; and
+5. accept only when the complete before/after token is equal.
+
+Pending-task revision is part of the same snapshot boundary because scheduler work can change capacity and object availability without an immediate distribution change. Capturing distribution and topology without the pending generation would allow the planner to observe old scheduler effects and then commit into a newer pending set. The before/after pending check makes snapshot construction stable, and the held effective-revision comparison closes the remaining capture-to-admission window.
+
+Current and Next target content is generation-consistent inside one attempt. For each collection and target scope, the builder reads version-before, copies sealed segments and channels, then reads version-after. A version change retries the attempt. This prevents old segments, new channels, and a new version from being accepted as one target snapshot.
+
+Workload on an RG physical node remains in node capacity even when replica metadata no longer has an owner. Such released/dirty placement is represented as capacity-only unowned work using `meta.NilReplica` (`ReplicaID=-1`) and is never offered as a normal move candidate. Nil-replica cleanup actions are scoped from action-node labels, ResourceManager physical membership, and outgoing RO/ROSQ ownership rather than an empty task Resource Group string.
+
+Segment and channel revisions remain separate for capture diagnostics. `PlacementSnapshotBuilder.Validate` deliberately does not reject an executing epoch merely because those revisions advanced: the epoch's own Grow and Reduce actions are expected to change distribution. It revalidates RG, node, replica, target, leader, and expected source presence. The scheduler gateway separately performs the atomic RG-scoped pending-generation check at commit time.
+
+#### Revision scope and RG independence
+
+RG independence means more than separate runtime mutexes. Unrelated RG activity must not repeatedly invalidate admission for this RG.
+
+The implementation uses an RG-filtered placement digest and per-RG pending revisions. Global segment/channel and pending revisions remain diagnostic fields only. Admission is wave-aware: successful commits from the current `BalanceEpochMeta` increase both absolute and epoch revisions, so the effective revision remains stable; external same-RG mutations change the effective revision and reject the remaining suffix. Unrelated RG distribution or scheduler churn does not retry or invalidate this RG.
+
+Ordinary task mutations advance only the affected RG revisions. A task with `ReplicaID == meta.NilReplica.GetID()` and an empty Resource Group is different: its RG scope is inferred from action nodes and topology, and that mapping may change between scope resolution and commit. Every such mutation therefore also advances a topology-independent `UnscopedRevision`. `RevisionFor(rg, epoch)` adds this fence to each RG revision, so RG epochs are independent from ordinary work elsewhere but are deliberately not independent from unscoped cleanup churn that could have entered their node scope.
 
 Revision equality is used to validate snapshot capture, not as a rule that aborts an executing epoch whenever distribution changes. The epoch's own Grow and Reduce actions are expected to advance distribution. Runtime invalidation is driven by the scoped event matrix below.
 
 ### Pending work
 
-The snapshot includes all admitted tasks whose effects are not fully reflected in distribution. This includes tasks created outside normal balance when they affect the same segments, channels, or nodes.
+The snapshot includes primitive copies of relevant scheduler tasks plus epoch carry-over tasks. `PendingWork.Tasks` deliberately retains every copied action, including actions whose effect is already reflected in the captured distribution. Only the aggregate `SegmentWorkloadByNode` and `ChannelWorkloadByNode` projections filter reflected actions. Keeping the raw actions is necessary because the policy later reconstructs per-collection pending effects; it must call the same reflection rule again instead of assuming every retained action still contributes workload.
 
 Pending effects remain distribution-aware:
 
@@ -270,7 +376,43 @@ Pending effects remain distribution-aware:
 - a Reduce effect is pending until the source distribution no longer contains the resource; and
 - an ambiguous RPC remains pending until reconciliation resolves the actual distribution.
 
-Current segment task deltas already filter action effects that distribution has absorbed. Current channel task deltas do not: they retain the full Grow/Reduce count until the whole task is removed. The first epoch implementation must either extend `ChannelTaskDelta` with action records equivalent to segment deltas or have `PlacementSnapshotBuilder` independently recompute channel effects against distribution. A snapshot must not double-count a channel Grow that is already visible.
+Ambiguous carry-over is converted back into synthetic Grow(target) and Reduce(source) actions and projected with the same distribution-reflection rule as scheduler tasks. Independently, `ReservationAmbiguousCapacity` locks the replica-scoped object and charges both positive endpoints against the later generation's per-node budget. The workload score and the admission-capacity guard are therefore explicit, separate mechanisms.
+
+Segment and channel task deltas now both store immutable action records and filter them against observed distribution. A channel Grow stops contributing `+1` once the target channel is visible; a Reduce stops contributing `-1` once the source channel disappears. The legacy `Scheduler.GetChannelTaskDelta` API remains available as a distribution-aware compatibility wrapper.
+
+The scheduler also exposes an optional primitive inspector without widening the public `Scheduler` interface:
+
+```go
+type BalancePendingRevision struct {
+    ResourceGroup string
+    Epoch         BalanceEpochMeta
+    Revision      uint64
+    EpochRevision uint64
+}
+
+func (r BalancePendingRevision) EffectiveRevision() uint64
+
+type PendingBalanceSnapshot struct {
+    Revision               uint64
+    UnscopedRevision       uint64
+    ResourceGroupRevisions map[string]uint64
+    EpochRevisions         map[BalanceEpochMeta]uint64
+    Tasks                  []PendingBalanceTaskSnapshot
+}
+
+type BalanceTaskInspector interface {
+    GetPendingBalanceTasks() PendingBalanceSnapshot
+}
+
+func (snapshot PendingBalanceSnapshot) RevisionFor(
+    resourceGroup string,
+    epoch BalanceEpochMeta,
+) BalancePendingRevision
+```
+
+The concrete scheduler publishes task actions, epoch attribution, status, and object identity as defensive primitive copies. `GetPendingBalanceTasks().RevisionFor(rg, epoch)` is the initial token later supplied to the first wave admission. Its absolute revision is `ResourceGroupRevisions[rg] + UnscopedRevision`; `EffectiveRevision()` subtracts successful commits attributed to the same active epoch. A pending-view RW lock covers task-index and delta mutation as one critical section. Per-RG revisions change after a complete add, replacement, or removal affecting that RG, so the inspector cannot return a mixed view assembled from different scheduler states. NilReplica tasks derive affected RGs from action nodes, ResourceManager physical membership, and outgoing RO/ROSQ ownership, while the independent unscoped fence closes the topology-change window.
+
+Neither `pendingMu` nor `scheduleMu` may cover external finalization. The locked removal phase mutates queues, indexes, deltas, stored scopes, and revisions, then returns a deferred finalizer. Synchronous target refresh, broker calls, retry loops, logging, node-penalty updates, and other potentially blocking cleanup run only after both locks are released. A blocked cleanup for one collection therefore does not prevent another collection from adding or admitting tasks or reading the pending snapshot.
 
 Pending work is not required to belong to the current epoch. A task carried over from an older generation keeps:
 
@@ -280,38 +422,161 @@ Pending work is not required to belong to the current epoch. A task carried over
 
 This allows the current planning generation to work on unrelated objects without pretending that old work disappeared.
 
+Scheduler inspection and epoch carry-over use the concrete merge implemented by `mergePendingTasks`:
+
+1. each task with a nonzero ID uses `task/<TaskID>` as its merge key;
+2. a synthetic carry record with no task ID uses `anonymous/<CollectionID>/<ReplicaID>/<Actions>`;
+3. scheduler records are inserted first, so a carry record with the same key is ignored rather than unioned with it;
+4. a task whose Resource Group matches the snapshot is copied in full; an unscoped NilReplica task is included only with actions whose nodes fall inside the RG snapshot scope; and
+5. the merged tasks are sorted by task ID, collection ID, and replica ID before workload projection.
+
+There is no action union and there are no retry, quarantine, ambiguity, or reservation fields inside `PendingBalanceTaskSnapshot`. Those concerns are separate manager-owned `EpochPlanningConstraints`. If a scheduler task has disappeared but the manager still owns an ambiguous object, `pendingCarryOver` synthesizes its Grow and Reduce actions, allowing the anonymous or task-ID record to remain visible to the next snapshot. Object locks and node charges remain keyed by replica-scoped `BalanceObjectKey`, so later planning cannot reuse that uncertain object.
+
 The object lock and reservation are owned by `BalanceEpochManager`, not by the current scheduler task record. Today, an RPC error can make the scheduler fail and remove a task, which also removes its scheduler dedup index and task delta. Epoch safety therefore cannot depend on that scheduler entry surviving. The epoch-owned record remains until distribution resolves the outcome, even if the underlying scheduler task has already been removed.
 
-In the first implementation, a capacity reservation consists of scheduler task slots plus the row/count workload effects understood by the configured current policy. This MEP does not claim exact byte-level admission. A future resource-aware planner may extend the same structure with memory, disk, GPU, and loading-byte reservations.
+In the MVP, a capacity reservation consists of scheduler task slots plus the row/count or channel-count workload effects understood by the configured current policy. This MEP does not claim exact byte-level admission. A future resource-aware planner may extend the same structure with memory, disk, GPU, and loading-byte reservations.
 
 ### Planning one wave
 
 The planner receives the placement snapshot and one RG-wide budget. Balance policy evaluation must use the immutable snapshot view; it must not re-read live distribution managers while planning. Existing policy behavior can be preserved through snapshot-backed adapters, but the existing `BalanceReplica(ctx, replica)` interface is insufficient as the epoch planner contract because its implementations read mutable global managers internally.
 
-The epoch-facing interface is conceptually:
+The epoch-facing planning interface is:
 
 ```go
-type BalancePlanner interface {
-    Plan(snapshot *PlacementSnapshot, budget BalanceWaveBudget) BalanceWave
+type EpochBalancePolicy interface {
+    Plan(
+        snapshot *PlacementSnapshot,
+        budget BalanceWaveBudget,
+        constraints EpochPlanningConstraints,
+        config EpochPolicyConfig,
+    ) BalanceWave
+    Evaluate(
+        snapshot *PlacementSnapshot,
+        projected *ProjectedPlacement,
+        kind PlanKind,
+        config EpochPolicyConfig,
+    ) ScorePotential
 }
-```
 
-The first implementation adapts the configured current policy to this interface and retains its scoring semantics. All returned plans are collected and simulated against one projected placement before admission.
+type EpochPolicyConfig struct {
+    GlobalRowCountFactor          float64
+    DelegatorMemoryOverloadFactor float64
+    CollectionChannelCountFactor  float64
+    AutoBalanceChannel            bool
+    StreamingServiceEnabled       bool
+}
 
-```go
+type EpochObjectConstraint struct {
+    Object          BalanceObjectKey
+    CollectionID    int64
+    From            int64
+    To              int64
+    Class           ReservationClass
+    ChargedNodes    []int64
+    QuarantineUntil time.Time
+}
+
+type ReservationClass int
+
+const (
+    ReservationQuarantineOnly ReservationClass = iota + 1
+    ReservationActiveTask
+    ReservationAmbiguousCapacity
+)
+
+type EpochPlanningConstraints struct {
+    Objects map[BalanceObjectKey]EpochObjectConstraint
+}
+
 type BalanceWaveBudget struct {
-    MaxSegmentTasks int
-    MaxChannelTasks int
-    MaxTasksPerNode int
+    MaxSegmentTasks       int
+    MaxChannelTasks       int
+    MaxTasksPerNode       int
     MaxTasksPerCollection int
 }
+
+type PlanKind int
+
+const (
+    PlanKindSegment PlanKind = iota + 1
+    PlanKindChannel
+)
+
+type EpochPlan struct {
+    Kind         PlanKind
+    CollectionID int64
+    ReplicaID    int64
+    Shard        string
+    SegmentID    int64
+    Channel      string
+    Scope        querypb.DataScope
+    RowCount     int64
+    From         int64
+    To           int64
+    Token        AdmissionToken
+}
+
+type ScorePotential struct {
+    Value float64
+}
+
+type BalanceWave struct {
+    Kind      PlanKind
+    Plans     []EpochPlan
+    PrefixAfter []ScorePotential
+    Decisions []BalancePlanDecision
+    Before    ScorePotential
+    After     ScorePotential
+    Converged bool
+}
+
+type BalancePlanDecision struct {
+    Plan        EpochPlan
+    Before      ScorePotential
+    After       ScorePotential
+    Result      string
+    Explanation string
+}
+
+type BalanceObjectKey struct {
+    Kind      BalanceObjectKind
+    ReplicaID int64
+    SegmentID int64
+    Channel   string
+    Scope     querypb.DataScope
+}
+
+type BalanceObjectKind int
+
+const (
+    BalanceObjectSegment BalanceObjectKind = iota + 1
+    BalanceObjectChannel
+)
+
+func (p EpochPlan) ObjectKey() BalanceObjectKey
+func (p EpochPlan) NodeActions() []int64
+
+func NewWaveLedger(
+    budget BalanceWaveBudget,
+    constraints EpochPlanningConstraints,
+) *WaveLedger
+
+func (l *WaveLedger) TryReserve(plan EpochPlan) bool
+func (l *WaveLedger) Release(plan EpochPlan)
+
+func (p *ProjectedPlacement) Apply(plan EpochPlan) error
+func (p *ProjectedPlacement) Undo(plan EpochPlan)
 ```
+
+The first implementation provides snapshot-backed adapters only for the configured names `ScoreBasedBalancer` and `ChannelLevelScoreBalancer`. Other configured balancers continue on the legacy path. `EpochPolicyConfig` is captured once when the checker tick creates the request and is frozen with a running generation; policy code does not reread dynamic global configuration during planning. All accepted candidates are applied to one `ProjectedPlacement`, so later candidates see the effects of earlier candidates from the same RG wave.
+
+Streaming Service support is intentionally narrower than non-streaming support. `ChannelLevelScoreBalancer` always falls back to legacy while Streaming Service is enabled. `ScoreBasedBalancer` also falls back when Streaming Service is enabled and `autoBalanceChannel=true`; it remains epoch-capable for segment-only planning when Streaming Service is enabled and `autoBalanceChannel=false`. These boundaries prevent active mode from claiming equivalence with live-manager streaming branches that the snapshot policy does not implement.
 
 The budget is a hard maximum. Plan generation stops or trims deterministically when the remaining budget is exhausted. A future MEP may add `MaxLoadBytes`, `MaxMemoryReservation`, and `MaxDiskReservation` without changing epoch lifecycle semantics.
 
 `MaxTasksPerNode` counts placement actions by the node whose placement changes: a move consumes one Grow slot on the target and one Reduce slot on the source. It does not count the shard leader used as the RPC routing hop. Existing executor concurrency remains a separate runtime limit.
 
-Carry-over and non-balance pending work is deducted from relevant node/object capacity before calculating the new wave budget. Within a wave:
+Distribution-aware scheduler pending work affects the projected row/channel score. Manager-owned ambiguous carry-over additionally locks its replica-scoped object and charges its source/target nodes against `MaxTasksPerNode`; quarantine locks the object without charging a node. Ordinary external pending tasks continue to rely on the scheduler's existing deduplication and generation fence rather than being represented as new-wave ledger reservations. Within a wave:
 
 1. later plans see the projected effects of earlier accepted plans;
 2. the same replica-scoped segment or channel object cannot appear in multiple plans;
@@ -319,44 +584,92 @@ Carry-over and non-balance pending work is deducted from relevant node/object ca
 4. plans have deterministic ordering; and
 5. the planner records why each plan was selected or skipped.
 
-This MEP does not require segment and channel plans to execute simultaneously. The planner may preserve channel-first policy semantics, but both plan types are accounted for by the same epoch and budget. Repeated channel waves therefore cannot cause an unrelated, overlapping normal epoch to start before reconciliation.
+`WaveLedger` stores kind counters, per-node action counters, per-collection counters, and a set of `BalanceObjectKey` locks. `TryReserve(plan)` first validates that plan fields and `AdmissionToken` identity agree exactly: collection, replica, source, kind, segment/channel key, and scope must match. Reservation is all-or-nothing across kind, collection, both node endpoints, and the replica-scoped object lock. A move consumes one segment/channel task slot but one node-action slot on both source and target. Zero or negative configured limits admit no new work. The ledger stores a private immutable `planMutationIdentity`; `Release` compares the supplied plan with that identity and reverses the stored collection, endpoints, kind, counters, and lock exactly once. Mutating a caller-owned plan cannot redirect release bookkeeping.
+
+The manager materializes `EpochPlanningConstraints` from ambiguous carry-over and active quarantine history. The policy never consults mutable manager state directly. `ReservationActiveTask` is supported by the ledger contract for callers that supply an active-task constraint, while the current manager represents scheduler-active effects in `PendingWork` and emits the other two classes. Charging is explicit:
+
+| Reservation class | Object lock | New-wave kind/collection cap | Node capacity reservation | Workload projection |
+|---|---:|---:|---:|---|
+| `ReservationQuarantineOnly` | Yes | No | No | Observed distribution only |
+| `ReservationActiveTask` | Yes | No | Action endpoints still pending | Distribution-aware pending effects |
+| `ReservationAmbiguousCapacity` | Yes | No | Conservative source/target endpoints | Keep observed source workload and reserve possible target workload |
+| New plan reserved by `WaveLedger` | Yes | Yes | Source and target | Apply projected move |
+
+New-wave task and per-collection caps limit admissions created by this generation; unresolved older work does not consume those kind/collection caps. Carry-over remains bounded by object locks and per-node charges, so one ambiguous channel does not block unrelated channel work when the involved nodes still have budget. Planning uses an internal ledger to construct the wave. Admission creates a fresh ledger from the same frozen constraints and reserves each plan again; a rejection releases that plan and stops the suffix, while accepted plans stay reserved until the generation reconciles.
+
+`ProjectedPlacement.Apply(plan)` applies the same plan/token identity validation, then verifies source presence and target absence before removing exactly one source placement and adding one target placement without reading live managers. Source missing, target already present, duplicate object application, or partial mutation returns an error and leaves projection unchanged. The apply record stores both the immutable mutation identity and the exact pre-mutation placement slice. `Undo` requires the same identity, reverses the stored mutation rather than trusting mutable plan fields, is valid exactly once, and restores the byte-for-byte prior projection. If reservation succeeds but projection or score validation fails, the planner undoes the projection and releases the reservation before considering another candidate.
+
+The MVP preserves channel-first policy semantics: if an RG wave contains any legal improving channel move, it does not also add segment moves. Both plan types still share the same epoch and hard budget. Repeated channel waves therefore cannot cause an unrelated, overlapping normal epoch to start before reconciliation.
 
 ### Convergence criterion and wave-level benefit
 
 Per-object benefit checks are not sufficient for an epoch. Multiple moves can each look beneficial against their local source and target while the complete wave over-corrects or produces little RG-level improvement.
 
-Every snapshot-backed policy adapter must expose one comparable objective for both planning and convergence:
-
-```go
-type ObjectiveValue interface {
-    Compare(other ObjectiveValue) int
-}
-
-type EpochBalancePolicy interface {
-    Plan(snapshot *PlacementSnapshot, budget BalanceWaveBudget) BalanceWave
-    Evaluate(snapshot *PlacementSnapshot) ObjectiveValue
-    ImprovementThreshold() ObjectiveValue
-}
-```
+Every snapshot-backed policy adapter exposes one `ScorePotential`. `ScorePotential.Improves` implements the single strict comparison `candidate.Value + 1e-9 < current.Value`. The same comparison is used when simulating an individual candidate, accepting the complete wave, and deciding convergence.
 
 The planner evaluates:
 
 ```text
-before = policy.Evaluate(observed snapshot)
-after  = policy.Evaluate(projected snapshot after the complete wave)
+before = policy.Evaluate(observed snapshot, observed projection, kind, frozen config)
+after  = policy.Evaluate(observed snapshot, projected placement, kind, frozen config)
 ```
 
-A normal wave is eligible for admission only when `after` improves on `before` by at least the policy's wave-level threshold. Planning, admission gating, and the `Converged` decision must use the same objective and deadband.
+A normal wave is eligible for admission only when `after.Value + 1e-9 < before.Value`. Planning, admission gating, and the `Converged` decision use this same strict-decrease rule; the MVP does not define a second policy-specific improvement threshold.
 
 An RG is converged for the current normal policy when:
 
 1. there is no recovery or hard-placement violation in the RG;
-2. no legal wave within the configured hard budget improves the objective by the minimum threshold; and
-3. unresolved carry-over work is either observed satisfied, safely locked, or quarantined and therefore excluded from duplicate planning.
+2. no legal wave within the configured hard budget passes the strict potential-decrease comparison; and
+3. there is no ambiguous carry-over still awaiting reconciliation; quarantined known-failure objects may remain excluded and observable until their backoff expires.
 
-The first implementation derives this objective from the existing ScoreBased/ChannelLevelScore scoring semantics. Resource-vector objectives are outside this MEP.
+The first implementation derives this objective from the existing ScoreBased/ChannelLevelScore workload and domain semantics, but active epoch mode intentionally does not reuse the legacy per-candidate `scoreUnbalanceTolerationFactor`, `reverseUnBalanceTolerationFactor`, or balance-cost tolerance gates. Those local gates are replaced by the one strict Lyapunov-style potential-decrease rule above. Legacy fallback continues to use the legacy balancer unchanged.
 
-Cross-epoch reverse cooldown is not required by this design. If the reconciled snapshot and the shared objective show that a reverse move is beneficial, the move may be legitimate after topology or workload changes. The implementation records reverse-move metrics; a cooldown can be added later only if non-improving reversals remain after wave-level gating.
+The snapshot's `MemoryCapacity` metadata is used only to allocate each eligible node's assigned-score quota when every target node reports a positive capacity. The current score is still derived from row and channel workload; the MVP does not observe or score current resident-memory usage, disk usage, loading bytes, or per-segment byte size. Memory/disk/GPU/schema-aware cost and migration byte cost remain follow-up policy dimensions built on the same epoch boundary.
+
+For each eligible domain and node, the segment score reproduces the existing policy from snapshot primitives:
+
+```text
+globalRows     = historical rows + growing rows + pending/carry-over row effects
+collectionRows = rows for this domain's collection + pending/carry-over effects
+currentScore   = float64(collectionRows
+                 + int(float64(globalRows) * GlobalRowCountFactor))
+
+assignedScore  = capacity-weighted quota when every node has positive MemCapacity
+                 otherwise equal share
+
+currentScore  += assignedScore
+                 * DelegatorMemoryOverloadFactor
+                 * delegatorCount(collection, node)
+
+domainPotential = sum((currentScore - assignedScore)^2)
+```
+
+Channel score preserves the existing split semantics. Resident channels belonging to the current collection use `max(1, CollectionChannelCountFactor)` and other resident channels use weight `1`. Pending channel actions are then added as `globalPendingDelta + currentCollectionPendingDelta`; they are not multiplied by `CollectionChannelCountFactor`.
+
+Physical workload is deduplicated by collection/object/node before scoring, so replica aliases do not multiply historical rows, growing rows, or resident channel counts. If the same physical move candidate is associated with more than one replica in the captured snapshot, the MVP excludes that candidate conservatively instead of risking duplicate movement under ambiguous replica ownership.
+
+`ChannelLevelScoreBalancer` creates one exclusive domain per `(replica, channel)` when every Current-target channel has channel RW-node assignments; outgoing RO placements remain valid sources. Otherwise it falls back to one replica-wide ScoreBased domain. In the MVP, `ChannelLevelScoreBalancer` active epoch mode is unsupported while Streaming Service is enabled because the legacy implementation first performs ScoreBased channel balancing and then uses different exclusive-loop rules. That combination falls back to legacy until a snapshot-backed streaming branch is specified and tested.
+
+Domains are sorted by collection, replica, and channel. Candidate objects are sorted by source overload and then stable object ID. Targets are sorted by projected deficit and then node ID. These rules make the same snapshot, budget, constraints, and frozen policy configuration produce the same wave.
+
+Each candidate is reserved, applied, and evaluated against the current projection. A candidate that does not strictly reduce potential is undone immediately. After all candidates, the complete wave is evaluated again against the observed snapshot; a non-improving aggregate wave is discarded even when individual moves had looked useful. Under static topology, target, and workload, every admitted prefix therefore strictly decreases a non-negative scalar potential. The sequence cannot admit an infinite static zero-net cycle and reaches a fixed point when no legal improving plan remains; the final potential need not be mathematically zero.
+
+Cross-epoch reverse cooldown is not required by this design. If the reconciled snapshot and the shared objective show that a reverse move is beneficial, the move may be legitimate after topology or workload changes. The #51244 convergence fixture records the move sequence and rejects static zero-net reversals; a dedicated reverse-move metric or cooldown is follow-up work only if non-improving reversals remain after wave-level gating.
+
+### Policy boundary and resource-aware follow-up
+
+The epoch solves when a decision is allowed to act and how its result is reconciled. It does not, by itself, make row count a sufficient resource model.
+
+The current ScoreBased adapters preserve the existing row/channel workload dimensions and placement domains while replacing their local candidate tolerances with the epoch-wide potential gate. A follow-up resource-aware policy should consume the same immutable snapshot and add:
+
+- observed or estimated resident memory, disk footprint, and loading bytes per segment;
+- schema/index-aware segment cost rather than assuming equal cost per row;
+- collection-level fairness so one collection is not concentrated while the RG appears globally balanced;
+- small-cluster spread objectives and large-cluster shard-aware placement domains;
+- hard node resource limits and soft collection/segment-count fairness; and
+- explicit migration-byte cost in the objective and admission budget.
+
+That policy must still obey the epoch invariants: one RG snapshot, one projected placement, one hard reservation ledger, strict whole-wave improvement, and distribution-based reconciliation. Keeping policy and orchestration separate prevents a new scoring model from hiding control-loop races.
 
 ### Admission
 
@@ -375,53 +688,53 @@ For every plan, admission revalidates at least:
 - scheduler deduplication; and
 - remaining epoch budget.
 
-All normal-balance and stopping-balance task producers must use one admission gateway. A checker must not bypass the gateway and call `Scheduler.Add` directly, because bypassing it would make RG budgets and reservations advisory rather than hard constraints.
+These checks belong to four explicit boundaries:
 
-The proposed commit interface is conceptually:
+| Boundary | Responsibility |
+|---|---|
+| Snapshot-only policy | Domain legality, source/target choice, deterministic ordering, and objective improvement. |
+| RG epoch manager | Current epoch identity, object lock, hard budget, and reservation before calling the scheduler. |
+| `PlacementSnapshotBuilder.Validate` | RG/node/replica/target/leader token and expected source presence. |
+| Scheduler held admission | Atomic RG-scoped pending-generation check, collection-lock ordering, resource deduplication, existing leader/source checks, ID allocation, replacement, indexes, deltas, task statistics, metrics, and queue visibility. |
+
+The scheduler gateway does not own the RG wave ledger. The manager reserves before admission and releases the reservation on any rejected result; only accepted tasks retain persistent budget and object locks.
+
+All epoch-generated normal-balance tasks use one typed admission gateway. Stopping and recovery tasks remain on the legacy path in the MVP; integrating them with a common admission class is explicitly deferred.
+
+Task 2 provides the base held gateway without changing the public `Scheduler` interface. Task 3 adds a generation-aware optional gateway while preserving the compatibility interface:
 
 ```go
-type AdmissionToken struct {
-    EpochID            BalanceEpochID
-    RGVersion          uint64
-    TargetVersion      int64
-    ReplicaVersion     int64
-    SegmentKey         *SegmentObjectKey
-    ChannelKey         *ChannelObjectKey
-    ExpectedSourceNode int64
+type BalanceAdmissionResult struct {
+    TaskID          int64
+    Reason          BalanceAdmissionReason
+    Err             error
+    PendingRevision BalancePendingRevision
 }
 
-type AdmissionReason int
+type BalanceAdmissionValidator func() BalanceAdmissionReason
 
-const (
-    AdmissionAccepted AdmissionReason = iota
-    AdmissionDuplicate
-    AdmissionSourceGone
-    AdmissionLeaderMissing
-    AdmissionReplicaChanged
-    AdmissionRGChanged
-    AdmissionTargetChanged
-    AdmissionNodeIneligible
-    AdmissionBudgetExhausted
-)
-
-type AdmissionResult struct {
-    TaskID int64
-    Reason AdmissionReason
+type BalanceTaskAdmitter interface {
+    AdmitBalanceTask(task Task, validate BalanceAdmissionValidator) BalanceAdmissionResult
 }
 
-TryAdmitBalanceTask(task Task, token AdmissionToken) AdmissionResult
+type BalanceTaskGenerationAdmitter interface {
+    AdmitBalanceTaskAtPendingRevision(
+        task Task,
+        expected BalancePendingRevision,
+        validate BalanceAdmissionValidator,
+    ) BalanceAdmissionResult
+}
 ```
 
-`TryAdmitBalanceTask` is the linearization point. The task must not become visible to dispatcher queues until the token, scheduler deduplication key, epoch-owned reservation, and hard budget have been validated and installed. Topology or target changes after this point are handled as scoped invalidation events. Existing scheduler resource deduplication remains authoritative inside this operation.
+Active epoch mode requires `BalanceTaskGenerationAdmitter`; the base `BalanceTaskAdmitter` remains for compatibility and tests. Generation-aware admission acquires the existing collection lock, runs the caller's topology/source validator, performs typed scheduler validation and deduplication, and runs the caller validator a second time. It then resolves affected RGs, acquires `scheduleMu`, determines any lower-priority replacement, and acquires `pendingMu` in that order. Under `pendingMu`, it compares `expected.EffectiveRevision()` with the current RG effective revision, removes the replacement from pending indexes, registers the new task, increments affected RG and epoch revisions, and returns the next `PendingRevision`.
 
-The implementation must close the validation-to-enqueue TOCTOU window. It may either acquire version-owner read fences in a documented lock order, or use optimistic two-phase admission:
+Replacement bookkeeping is committed before slow finalization. `pendingMu` is released before replacement penalties and cancellation, `scheduleMu` is released before task statistics, metric/log publication, target refresh, broker calls, or other external cleanup, and no slow finalizer runs under either lock. This preserves one atomic pending-generation boundary without allowing one collection's finalization to block unrelated admission or inspection.
 
-1. create a held, non-dispatchable task and reservation;
-2. validate all token versions;
-3. re-read the versions after registration;
-4. atomically commit the task to dispatcher-visible queues if unchanged; otherwise roll back the held task and reservation.
+The manager replaces the remaining wave token with `result.PendingRevision` after every accepted task. Same-epoch successful commits increase both absolute RG and epoch revisions, leaving the effective revision stable for the wave. Legacy adds, failures, removals, and other same-RG mutations increase only the effective revision and reject the next admission. Epoch revision entries are pruned after the epoch's final active task is removed; the absolute RG revision still keeps old tokens stale. The task receives no ID and is absent from dispatcher queues, indexes, deltas, task statistics, and metrics before all final checks succeed.
 
-In both implementations, no QueryNode action can be dispatched between token validation and admission commit.
+Stable reasons are `accepted`, `duplicate`, `source_gone`, `leader_missing`, `replica_changed`, `resource_group_changed`, `target_changed`, `node_ineligible`, `budget_exhausted`, `stale_epoch`, and `internal_error`. During admission, leader, replica, RG, target, node-eligibility, stale-epoch, and internal failures stop the suffix as superseding conditions; duplicate, source-gone, and budget rejection stop the suffix as degraded/local conditions. In every case the accepted prefix remains admitted and the unattempted suffix is reported separately.
+
+No QueryNode action can be dispatched between the final token validation and admission commit. A topology change after commit is ordered after admission and is handled by epoch invalidation and distribution-based reconciliation.
 
 Admission errors must be typed. Epoch state transitions must not parse error strings to distinguish a duplicate from a stale source or changed topology.
 
@@ -433,7 +746,11 @@ admitted = AdmissionReason == AdmissionAccepted
 rejected = any other typed AdmissionReason
 ```
 
-Only admitted tasks consume the new-wave budget and appear in epoch completion accounting. Carry-over work is accounted separately before the budget is calculated. If a rejection indicates a stale snapshot, admission stops for plans in the invalid scope and enters reconciliation. A local rejection such as a duplicate task may be recorded while other independent plans continue, provided their preconditions remain valid.
+Only admitted tasks consume persistent new-wave budget and appear in epoch completion accounting. Carry-over work is accounted separately before the budget is calculated.
+
+Admission processes plans in the same deterministic order used during projected simulation. The first rejection stops the rest of the wave. The already accepted prefix remains valid because every accepted candidate strictly improved the projection produced by the preceding accepted prefix. Continuing with a later plan would be unsafe: that plan was scored against a projection containing the rejected move. Rejected and unattempted plans are released and reconsidered from a fresh snapshot in the next generation.
+
+`BalanceWave.PrefixAfter[i]` is the potential after plans `0..i`. If admission accepts `k` plans before stopping, `EpochAdvanceResult.ObjectiveAfter`, objective metrics, and #51244 assertions use `Before` when `k=0` or `PrefixAfter[k-1]` otherwise. They never report the uncommitted full-wave `After` value after a partial admission.
 
 Tasks admitted by an epoch carry metadata identifying the RG and epoch ID. This metadata is diagnostic and does not replace the scheduler's existing resource deduplication keys.
 
@@ -450,7 +767,126 @@ The following invariants must be preserved:
 5. An action with an ambiguous RPC outcome remains locked until distribution reconciliation.
 6. The epoch planner never mutates distribution or manufactures pending-task deltas.
 
+The implementation does not introduce an executor-stage or RPC-outcome interface. It observes only the existing synchronized task surface—`Task.Done()`, `Task.Status()`, and `Task.Err()`—together with authoritative segment/channel distribution. This keeps the epoch independent from the scheduler's mutable action step.
+
+Classification is deliberately conservative:
+
+- target present and ready while source is absent is completed regardless of the task label;
+- `Started` or `Canceled` with any other placement is ambiguous carry-over;
+- `Failed` with source present and target absent is a known Grow failure;
+- `Failed` with both copies present is a known Reduce failure;
+- `Failed` with neither copy present is lost placement and therefore degraded; and
+- `Succeeded` without the desired authoritative placement is still ambiguous.
+
+For a channel, target readiness additionally requires a serviceable target record, a nonzero leader equal to the target node, and a leader target version at least as new as the frozen Current-target version. Task terminality or RPC success never substitutes for placement readiness.
+
 ### Epoch state machine
+
+The state machine is tick-driven. It does not create a long-lived epoch goroutine. `BalanceChecker.Check()` performs at most one active-generation advancement per RG in a tick through the interface below. An inactive RG with retained retry history may first receive an observation-only call and later a new active or shadow planning call in the same tick; no two calls can own concurrent generations because `HasActive`, the tick-start set, and the per-RG `TryLock` enforce ownership.
+
+```go
+type EpochRequest struct {
+    ResourceGroup      string
+    EligibleReplicaIDs []int64
+    Balancer           string
+    Budget             BalanceWaveBudget
+    PolicyConfig       EpochPolicyConfig
+    AllowNew           bool
+    Shadow             bool
+    Deadline           time.Duration
+    NoProgressDeadline time.Duration
+    SegmentTaskTimeout time.Duration
+    ChannelTaskTimeout time.Duration
+    MaxObjectRetries   int
+    QuarantineBackoff  time.Duration
+}
+
+type BalanceEpochController interface {
+    Advance(context.Context, EpochRequest) EpochAdvanceResult
+    HasActive(resourceGroup string) bool
+    ActiveResourceGroups() []string
+    ResourceGroupsToObserve() []string
+}
+
+type EpochAdvanceResult struct {
+    ResourceGroup    string
+    Epoch            task.BalanceEpochMeta
+    State            EpochState
+    Planned          int
+    Admitted         int
+    Rejected         map[task.BalanceAdmissionReason]int
+    Started          bool
+    Terminal         bool
+    Converged        bool
+    ObjectiveBefore  float64
+    ObjectiveAfter   float64
+    Err              error
+}
+
+type EpochState int
+
+const (
+    EpochIdle EpochState = iota
+    EpochPlanning
+    EpochAdmitting
+    EpochExecuting
+    EpochReconciling
+    EpochCompleted
+    EpochDegraded
+    EpochSuperseded
+    EpochTimedOut
+)
+```
+
+The manager uses a small global map lock only to obtain the per-RG runtime. Each RG runtime has its own mutex, sequence, active epoch, reservations, object locks, retry history, and carry-over work. `Advance` uses `TryLock`; a concurrent same-RG call returns the last published result instead of blocking or creating a second generation. A blocked RG-A therefore does not prevent RG-B from observing, planning, admitting, or reconciling.
+
+`HasActive(resourceGroup)` and `ActiveResourceGroups()` report only the current generation while its active flag is retained. A terminal generation is cleared at the start of the next `Advance`; the checker remembers which RGs were active at tick start and therefore does not start another generation for that RG in the same tick. Ambiguous carry-over is consumed as a planning constraint by a later generation. Retry/quarantine history is exposed separately through `ResourceGroupsToObserve()` so it can be pruned or dynamically disabled without suppressing legacy balance when no generation is active.
+
+The constructor makes mutable boundaries explicit and testable:
+
+```go
+func NewBalanceEpochManager(
+    metadata *meta.Meta,
+    dist *meta.DistributionManager,
+    targetMgr meta.TargetManagerInterface,
+    nodeMgr *session.NodeManager,
+    scheduler task.Scheduler,
+    admitter task.BalanceTaskGenerationAdmitter,
+    inspector task.BalanceTaskInspector,
+    source task.Source,
+    policyProvider func(string, EpochPolicyConfig) (EpochBalancePolicy, bool),
+    opts ...EpochManagerOption,
+) *BalanceEpochManager
+
+func WithEpochClock(now func() time.Time) EpochManagerOption
+func WithLeaderTerm(term uint64) EpochManagerOption
+func WithEpochTaskFactory(factory EpochTaskFactory) EpochManagerOption
+
+type PlacementSnapshotSource interface {
+    Build(context.Context, string, []int64, []task.PendingBalanceTaskSnapshot) (*PlacementSnapshot, error)
+    Validate(AdmissionToken) task.BalanceAdmissionReason
+}
+
+func WithPlacementSnapshotSource(source PlacementSnapshotSource) EpochManagerOption
+```
+
+`Planning` and `Admitting` are synchronous transient phases inside the start call. The call may capture, plan, reserve, and admit a bounded wave, but it never waits for QueryNode task completion or sleeps for progress. `Executing` and `Reconciling` persist across checker ticks.
+
+One checker tick performs this bounded advancement:
+
+| Current condition | Tick action |
+|---|---|
+| No active epoch and `AllowNew=false` | Return `Idle`. |
+| No active epoch and `Shadow=true` | Snapshot, plan, emit comparison data, and return without runtime state, locks, reservations, or admission. |
+| No active epoch and `AllowNew=true` | Enter transient `Planning`/`Admitting`, then persist `Executing` or finish `Completed/Converged`. |
+| `Executing` | Inspect `Task.Done`, task status, deadlines, and authoritative placement. |
+| Quiescent, invalidated, or deadline reached | Enter `Reconciling`. |
+| `Reconciling` | Classify all accepted objects, rebuild carry-over, then publish a terminal result. |
+| Tick after a terminal result | Clear the old generation. The checker does not restart an RG that was active at tick start; a later tick may create a fresh generation. |
+
+The manager checks the overall deadline before and after snapshot, planning, and each admission. If the deadline expires during a transient phase, it stops generating/admitting and reconciles the accepted prefix. Already admitted work is not assumed cancelled. Repeated checker triggers cannot overlap these phases because the per-RG runtime mutex covers the complete `Advance` call.
+
+Balancer name, budget, policy factors, deadlines, task timeouts, retry count, and quarantine backoff are captured when a new generation starts and remain immutable for that generation. Dynamic configuration changes apply to the next generation; they do not change the objective or retry policy midway through an admitted wave. When no generation is active, an observation-only request may immediately clear retained retry/quarantine state if retries or backoff are dynamically disabled.
 
 ```text
 Idle
@@ -462,7 +898,7 @@ Planning
 Admitting
   | at least one task admitted
   v
-Executing / Observing
+Executing
   | wave reaches quiescence, no-progress deadline,
   | or scoped invalidation occurs
   v
@@ -479,11 +915,13 @@ If planning produces no improving plan and the snapshot remains valid, the epoch
 
 Planning and admission edge cases are explicit:
 
-- Plans generated but every admission is `Duplicate`: reconcile existing pending work; finish `Completed` only if observed placement is already satisfied, otherwise `Degraded`.
+- First admission is `Duplicate` or another local rejection: stop the wave, reconcile existing pending work, and replan from a fresh snapshot.
 - A stale-snapshot rejection before any admission: transition to `Superseded` through reconciliation.
-- A scoped stale rejection after partial admission: retain admitted tasks, discard unadmitted plans in that scope, and reconcile before publishing the next generation.
+- Any rejection after partial admission: retain the validated accepted prefix, discard the remaining suffix, and reconcile before publishing the next generation.
 - Deadline during `Planning` or `Admitting`: stop generation/admission and transition through reconciliation to `TimedOut`.
-- An RG-wide invalidation in any non-terminal state: stop admission and transition to `Superseded`; already dispatched actions follow safe-settle rules.
+- During admission, RG/node/replica/target/leader generation invalidation or `StaleEpoch` stops the suffix and transitions toward `Superseded`; already admitted actions follow reconciliation rules.
+- During execution, `StaleEpoch` is not a superseding signal because normal completion/removal of the epoch's own tasks advances the RG pending revision and may prune its epoch revision. Execution is reconciled from task state and authoritative placement.
+- `LeaderHash` remains a strict admission fence, but leader publication is also non-superseding after admission: a successful channel Grow necessarily publishes a new leader, and delegators may republish while admitted work executes. RG, node, replica, and target changes remain superseding.
 
 Terminal state definitions:
 
@@ -498,32 +936,40 @@ All terminal states permit a later epoch. None permits the next epoch to reuse t
 
 ### Quiescence and generation handoff
 
-An empty task set is not sufficient to declare an epoch complete. Before a terminal transition or handoff to a newer generation, the controller must verify:
-
-1. every admitted object is terminal, observed satisfied, quarantined, or explicitly classified as carried-forward safe-settle work;
-2. every ambiguous action retains its object lock and conservative capacity reservation;
-3. distribution has advanced or been refreshed after the last relevant task event;
-4. pending reservations have been removed or rebuilt from scheduler state;
-5. actual placement is compared with the wave's successful outcomes; and
-6. the next snapshot includes all unresolved work before planning unrelated objects.
+An empty scheduler queue is not sufficient to declare an epoch complete. The manager waits until every admitted or carried object is quiescent: either the desired authoritative placement is visible, the task status is no longer `Started`, or `Task.Done()` is closed. It then classifies all objects from one captured distribution, rebuilds the carry map, records known failures, and publishes a terminal result. An ambiguous action retains its object lock and conservative source/target node charges; a later snapshot receives synthesized pending actions for it.
 
 The result determines `Completed`, `Degraded`, `Superseded`, or `TimedOut`. A stuck object does not block the whole RG indefinitely, but it cannot be moved again or have its reserved capacity reused while its outcome is uncertain.
 
+Reconciliation applies this ordered placement/status matrix:
+
+| Precedence | Task status | Target/source presence | Classification and outcome |
+|---:|---|---|---|
+| 1 | Any | Ready target present, source absent | Completed; clear retry history and release the object constraint. |
+| 2 | `Started` or `Canceled` | Any other placement | Ambiguous carry-over; keep object lock and charge both positive source/target endpoints. |
+| 3 | `Failed` | Target absent, source present | Known Grow failure; retain source, record retry history, finish degraded. |
+| 4 | `Failed` | Target present, source present | Known Reduce failure/redundant copy; record retry history, finish degraded, and let existing cleanup logic resolve the extra copy. |
+| 5 | `Failed` | Target absent, source absent | Lost placement; record retry history and force `Degraded`, even if the prior intent was timeout or supersession. |
+| 6 | `Failed` | Target present, source absent but target not ready | Ambiguous until target readiness becomes authoritative. |
+| 7 | `Succeeded` or any other status | Desired placement not observed | Ambiguous carry-over; task success alone is not authoritative. |
+
+Only accepted scheduler admissions enter this table. Rejected plans release their provisional wave reservation immediately and do not increment admitted-task accounting.
+
 ### Epoch deadline
 
-The epoch owns an explicit deadline. It does not depend on the currently ineffective timeout argument accepted by balance task constructors.
+The epoch owns an explicit control-loop deadline. `EpochRequest` also carries the existing segment and channel task timeout settings into `NewSegmentTask` and `NewChannelTask`, but those constructors currently ignore their `timeout` argument: `newBaseTask` derives only `context.WithCancel`, not `context.WithTimeout`. The epoch deadline is therefore the implemented bound on planning/admission/no-progress orchestration, independent of per-task constructor timeout behavior.
 
 When the deadline expires:
 
 1. stop admitting new plans;
-2. cancel tasks that have not started when cancellation is safe;
-3. do not assume that already dispatched RPCs were cancelled;
-4. reconcile every ambiguous Grow or Reduce against distribution;
-5. release or rebuild reservations; and
-6. carry unresolved safe-settle tasks and their locks into the next snapshot; and
-7. finish the epoch as `TimedOut`.
+2. do not assume that any already admitted or dispatched RPC was cancelled;
+3. reconcile every ambiguous Grow or Reduce against distribution;
+4. release or rebuild reservations;
+5. carry unresolved safe-settle tasks and their locks into the next snapshot; and
+6. normally finish as `TimedOut`.
 
-An in-flight Grow is not followed by Reduce unless target presence is confirmed. A completed Grow with a failed or cancelled Reduce is handled as a redundant-copy repair in the next epoch. The next epoch may plan unrelated objects while this repair remains locked.
+Terminal precedence is based on final observed state. If a deadline intent exists but every object reaches desired placement with no known failure or carry, reconciliation upgrades the result to `Completed`. Lost placement always forces `Degraded`. Otherwise unresolved carry retains `TimedOut`, while a superseding topology/target intent remains `Superseded`.
+
+An in-flight Grow is not followed by Reduce unless target presence is confirmed. Only a definitive terminal Reduce failure can be classified as a redundant copy. Cancelled, deadline, unavailable, or lost-response Reduce remains ambiguous and carries its lock/reservation until later distribution proves the result. The next epoch may plan unrelated objects while this object remains locked.
 
 ### Scoped invalidation matrix
 
@@ -533,16 +979,18 @@ Runtime changes do not all invalidate the same scope:
 |---|---|
 | RG node add/remove, RW-to-RO transition, or RG capacity/quota change | Hard-supersede the current RG generation because shared capacity assumptions changed. |
 | Replica moved into or out of the RG | Supersede the affected RG generations. |
-| Target version changed for one collection | Discard unadmitted plans for that collection and lock/reconcile its admitted objects; unrelated collections may continue or enter the next generation. |
-| Channel-exclusive mapping changed | Invalidate the affected replica/shards, not unrelated replicas. |
+| Target version changed for one collection | MVP conservatively stops the current RG's remaining admission and reconciles admitted objects. A fresh generation may immediately continue unrelated collections. |
+| Channel-exclusive mapping changed | MVP conservatively stops remaining RG admission and reconciles; finer replica/shard continuation within the same generation is follow-up work. |
 | Expected distribution change caused by this epoch's task | Do not invalidate; reconcile it as expected feedback. |
-| Recovery task conflicts with the same segment/channel | Recovery supersedes the normal task for that object using the recovery admission class and safe cancellation rules. |
-| Unrelated collection distribution changed | Refresh projected state if needed, but do not automatically abort the RG generation. |
-| QueryNode resource exhausted | Update node penalty/reservation assumptions and stop further admission to that node; replan affected work. |
+| Stopping work is admitted by `BalanceChecker` | Do not start a new normal epoch in that tick; active epochs continue observation and reconciliation. |
+| Independent recovery task changes pending work | During admission, the effective pending revision rejects the remaining suffix. During execution, `StaleEpoch` is ignored and authoritative placement/task state owns reconciliation. The MVP has no same-tick recovery preemption signal. |
+| Unrelated or same-RG placement publication without topology/target change | Do not automatically abort execution; ordinary `PlacementHash` changes are feedback, not supersession. |
+| QueryNode resource exhausted | Stop remaining admission, reconcile accepted work, and rebuild the next generation with updated node eligibility/penalty. |
 | RPC timeout or temporary unavailable | Keep the object locked and reconcile/retry within its bounded policy; do not automatically invalidate unrelated plans. |
 | Source resource disappeared | Mark the plan stale and reconcile that object. |
-| Shard leader changed | Invalidate tasks and plans whose execution path depends on that leader; unrelated shards remain eligible. |
-| QueryCoord leader term changed | Supersede all old epochs and ignore old-term callbacks. |
+| `LeaderHash` changed before admission | Reject admission as `leader_missing` and stop the suffix as superseded. |
+| Leader publication after admission | Do not supersede execution, including publication for an unrelated collection; channel handoff itself changes leader state. Reconcile using target readiness and task outcome. |
+| QueryCoord restarts | The in-memory manager and its process-boot leader term are replaced; recovered distribution is replanned rather than replaying the old epoch. |
 
 In particular, the implementation must not abort an epoch merely because a cluster-global distribution version changed. The epoch's own tasks and unrelated RGs both advance those versions.
 
@@ -557,7 +1005,7 @@ If Grow fails and the target is absent from distribution:
 - keep the source copy;
 - mark the task failed;
 - release its destination reservation;
-- record the destination's typed failure, including resource exhaustion when available; and
+- retain the task error and increment epoch-level object retry history; existing scheduler/node resource-exhaustion penalties remain unchanged; and
 - allow independent tasks in the epoch to continue.
 
 The next epoch may choose a different target. Repeated failures trigger the existing node resource-exhaustion penalty when applicable and the quarantine policy below.
@@ -567,11 +1015,11 @@ The next epoch may choose a different target. Repeated failures trigger the exis
 The epoch layer must prevent one permanently failing object from monopolizing the RG control loop.
 
 - The first implementation does not add in-place scheduler action retries. An RPC failure terminates the scheduler task according to current behavior.
-- Epoch reconciliation classifies the result and a later generation may admit a newly planned task after backoff if the preconditions still make sense.
-- Each object has a bounded number of consecutive epoch-level retries before quarantine.
-- An object that reaches the no-progress deadline without an ambiguous in-flight RPC is quarantined for a configured backoff interval.
+- Epoch reconciliation classifies the result and a later generation may admit a newly planned task if the preconditions still make sense.
+- Each object has a bounded number of consecutive known epoch-level failures before quarantine; attempts below the threshold are retained as retry history but are not delayed by a separate per-attempt backoff.
+- The no-progress deadline sets a timeout intent and forces reconciliation. It does not by itself quarantine an ambiguous object.
 - An object with an ambiguous in-flight RPC remains locked and reserved rather than retried.
-- Quarantine is cleared when its backoff expires or when a relevant topology, target, replica, leader, or node-penalty change provides new evidence that retry may succeed.
+- Quarantine/retry history is cleared when its backoff expires, when the frozen RG/replica/node/leader/target topology changes, or when retry/quarantine is dynamically disabled.
 - Quarantined objects are reported as degraded placement, but they do not block unrelated collections, replicas, or shards.
 
 Quarantine is a control-loop decision, not a declaration that the segment may be dropped. Existing availability and target checkers remain responsible for required copies.
@@ -581,58 +1029,52 @@ Quarantine is a control-loop decision, not a declaration that the segment may be
 If the Grow RPC times out or loses its response, the task must not immediately retry or replan the segment. Reconciliation checks target distribution:
 
 - target present: treat Grow as successful and continue or repair Reduce;
-- target absent: treat Grow as failed and release the reservation.
+- Grow has a definitive terminal failure, target absent, source present: treat Grow as failed and release the destination reservation; and
+- task not terminal or Grow outcome is transport-ambiguous with target absent: keep the object lock and conservative reservation as ambiguous carry-over. Absence at one observation point is not proof that an already-dispatched Grow cannot still become visible.
 
 #### Reduce failure
 
-If target presence was confirmed but Reduce fails, the segment may exist on both source and target. This is availability-safe but consumes extra resources.
+If target presence was confirmed and Reduce has a definitive terminal failure, the segment may exist on both source and target. This is availability-safe but consumes extra resources. A non-terminal, cancelled, timed-out, unavailable, or lost-response Reduce is not classified here; it remains ambiguous.
 
-The epoch records a partial completion and ends as `Degraded` after reconciliation. The next epoch decides which copy to keep based on current target, topology, and policy. It must not automatically generate a reverse move merely because Reduce failed.
+The epoch records a partial completion and ends as `Degraded` after reconciliation. The MVP does not add a standalone cleanup plan type: existing target/availability checkers decide which copy to remove. Normal epoch policy keeps the object locked for the current handoff and must not generate a reverse move merely because Reduce failed.
 
 #### Node failure
 
 A node failure invalidates the RG snapshot and immediately stops normal admission:
 
-1. mark the current generation `Superseding`;
-2. cancel not-started normal-balance tasks when safe;
-3. leave dispatched actions to distribution-based reconciliation;
-4. run or allow higher-priority recovery for missing channels and segments;
+1. stop admission and move the current generation to `Reconciling`;
+2. stop new normal admission;
+3. leave admitted actions to distribution-based reconciliation;
+4. run or allow the existing higher-priority recovery path for missing channels and segments;
 5. rebuild authoritative RG state; and
 6. end the normal epoch as `Superseded`.
 
 Recovery does not wait for the normal epoch to reach its original deadline.
 
-#### Shard leader change
+#### Shard leader publication
 
-A leader change invalidates tasks whose execution path depends on the old leader. The controller stops admission for the affected shard/replica and enters reconciliation for those objects. Existing scheduler safety checks continue to reject Reduce through an unexpected leader. Unrelated shards in the RG are not automatically invalidated.
+The admission token freezes `LeaderHash`, so a leader change before commit rejects the suffix. After admission, leader publication is mutable execution-plane state rather than an epoch-generation fence: a successful channel Grow must publish the target as leader, and any delegator may republish while Segment work is running. Execution-time `leader_missing` is therefore ignored for supersession. Channel reconciliation still requires the target record to be serviceable, led by the target node, and at least at the frozen target version; scheduler safety checks continue to protect action dispatch.
 
 #### Target, replica, or RG membership change
 
-A target version change invalidates plans for the affected collection. A replica topology change invalidates the affected replica. An RG membership or capacity change supersedes the whole RG planning generation because every destination-capacity assumption may have changed. Unadmitted plans in the invalid scope are discarded. Admitted tasks are reconciled according to their actual stage; recovery and target-consistency checkers retain higher priority.
+A target version change, replica topology change, or node-eligibility change stops the current RG's remaining admission and supersedes execution. A pre-admission leader change also stops the suffix; a post-admission leader publication does not. An RG membership or capacity change supersedes the whole generation. Unadmitted suffix plans are discarded; admitted tasks are reconciled from actual placement and task status. A fresh generation can continue unrelated work from a new snapshot. Recovery and target-consistency checkers retain higher priority.
 
 ### Normal versus recovery priority
 
-Normal balance is opportunistic. Stopping balance and recovery protect availability and topology correctness. They share RG admission capacity but use separate priority lanes and object-level conflict scopes.
+Normal balance is opportunistic. Stopping balance and recovery protect availability and topology correctness and remain higher priority.
 
-This behavior cannot be implemented using current `TaskPriority` values alone because normal and stopping tasks of the same resource type may have equal priority, while scheduler replacement currently requires strictly higher priority. The epoch design therefore introduces an admission class independent of execution priority:
+The MVP deliberately does not introduce a recovery admission class or route stopping/recovery task producers through `BalanceEpochManager`. `BalanceChecker` first runs the existing stopping-balance path. If stopping work is admitted, it does not create a new normal epoch in that tick. Existing recovery and availability checkers continue to use their current scheduler paths.
 
-```text
-AdmissionClassRecovery > AdmissionClassNormal
-```
+An active normal epoch is never abandoned merely because new normal work is disabled. Checker deactivation, `autoBalance=false`, feature disablement, unsupported policy selection, or stopping-balance precedence set `AllowNew=false`; the manager still observes and reconciles active tasks and carry-over locks.
 
-For the same replica-scoped object key, a recovery admission may cancel a not-started normal task or supersede its epoch-owned lock. A running normal action is not forcibly killed; it reaches a safe point and is reconciled. Execution-pool priority may continue to use existing task priority after admission.
+Topology and distribution changes caused by recovery are observed through the snapshot token and authoritative distribution. They may supersede the normal generation, but the MVP does not promise atomic normal-versus-recovery reservation replacement or epoch-scoped cancellation.
 
-Priority rules:
+A later recovery-integration MEP may add:
 
-1. A normal epoch never blocks node-down recovery or stopping balance.
-2. Recovery reserves admission capacity before normal balance and may replace a lower-admission-class task on the same scheduler deduplication key.
-3. An RG-wide capacity/topology event supersedes the current normal generation.
-4. A single missing segment, leader change, or collection target change freezes only its conflicting object/replica scope; unrelated normal work may continue when the RG remains serviceable.
-5. Recovery may bypass normal cooldown and movement-benefit thresholds.
-6. Recovery still preserves Grow-before-Reduce and destination eligibility.
-7. When the RG is not serviceable, recovery may consume the full admission budget.
-
-The initial implementation may keep existing stopping and recovery checkers as plan producers. `BalanceEpochManager` coordinates their priority and invalidation effects without requiring those checkers to share the normal scoring policy.
+- explicit recovery and normal admission classes;
+- object-scoped preemption of not-started normal tasks;
+- shared RG capacity reservation across recovery and normal work; and
+- finer-grained shard/replica invalidation events.
 
 ### QueryCoord restart
 
@@ -650,7 +1092,7 @@ This avoids treating an old projected plan as durable desired state. Target meta
 
 An old leader's already-dispatched RPC may still take effect after the new leader starts; `LeaderTerm` cannot prevent that external side effect. A later distribution pull observes it, and the new leader's recovery/redundancy logic reconciles the resulting actual placement.
 
-### Proposed components
+### Implemented components
 
 #### BalanceEpochManager
 
@@ -659,7 +1101,8 @@ Responsibilities:
 - owns the current planning generation and carry-over work map keyed by RG;
 - serializes planning and admission within one RG;
 - permits epochs in different RGs to proceed concurrently;
-- receives topology and task events;
+- advances through checker ticks rather than a dedicated goroutine;
+- polls task completion and authoritative distribution;
 - manages deadlines, supersession, quarantine, and terminal transitions; and
 - exposes epoch status and metrics.
 
@@ -671,17 +1114,17 @@ Responsibilities:
 - validates the version tuple before publishing a snapshot; and
 - retries or reports a transient failure when a consistent snapshot cannot be obtained.
 
-#### BalancePlanner
+#### EpochBalancePolicy and WaveLedger
 
 Responsibilities:
 
 - consumes only immutable snapshot data;
 - invokes a snapshot-backed adapter for the configured channel/segment policy;
-- simulates all accepted plans in one projected placement;
+- simulates candidates in one shared projected placement;
 - enforces the hard wave budget; and
-- returns deterministic plans and explanations.
+- gates candidates, the whole wave, and convergence with one score potential.
 
-#### EpochReconciler
+#### Reconciliation inside BalanceEpochManager
 
 Responsibilities:
 
@@ -691,71 +1134,119 @@ Responsibilities:
 - determines the terminal epoch state; and
 - produces the authoritative input boundary for the next epoch.
 
+### Delivery map
+
+| MEP component | Milvus package/file |
+|---|---|
+| Epoch/task identity, typed admission, pending generations, task completion | `internal/querycoordv2/task/balance_admission.go`, `task.go`, `scheduler.go` |
+| Atomic QueryNode segment/channel publication and capture | `internal/querycoordv2/meta/dist_manager.go`, `segment_dist_manager.go`, `channel_dist_manager.go`, `internal/querycoordv2/dist/dist_handler.go` |
+| Immutable placement snapshot and admission validation | `internal/querycoordv2/balance/epoch_types.go`, `epoch_snapshot.go` |
+| Hard wave budget, object locks, projected apply/undo | `internal/querycoordv2/balance/epoch_wave.go` |
+| Snapshot-only ScoreBased/ChannelLevel policy and strict potential | `internal/querycoordv2/balance/epoch_score_policy.go`, `balancer_factory.go` |
+| Per-RG tick-driven state machine and reconciliation | `internal/querycoordv2/balance/epoch_manager.go` |
+| Checker orchestration, drain, shadow, legacy fallback, fair collection cursor | `internal/querycoordv2/checkers/balance_checker.go` |
+| Runtime construction | `internal/querycoordv2/server.go` |
+| Dynamic rollout configuration | `configs/milvus.yaml`, `pkg/util/paramtable/component_param.go` |
+| Prometheus collectors | `pkg/metrics/querycoord_metrics.go` |
+| Deterministic unit, state-machine, checker, and #51244 fixtures | matching `_test.go` files in the packages above |
+
 ### Integration with BalanceChecker
 
-`BalanceChecker` remains a trigger and eligibility component but no longer submits normal balance tasks directly.
+`BalanceChecker` remains a trigger and eligibility component. In active epoch mode with a supported policy, it no longer submits normal balance tasks directly. Disabled mode, shadow mode, unsupported policies, or missing optional scheduler capabilities retain the legacy normal-balance path.
 
-The proposed flow is:
+The implemented flow is:
 
 ```text
 BalanceChecker tick/manual trigger
-    -> identify RGs eligible for normal balance
-    -> BalanceEpochManager.TryStart(resourceGroup)
-    -> snapshot / plan / admission / execution / reconciliation
+    -> run legacy stopping balance
+    -> observe every active or retained-state RG with AllowNew=false
+    -> determine whether a new normal epoch is allowed
+    -> group eligible replicas by RG deterministically
+    -> BalanceEpochManager.Advance(request)
 ```
 
 If an RG already has a current normal planning generation, repeated periodic triggers are coalesced. They do not create another concurrent planner for the RG. A trigger received during reconciliation may request the next generation after resolved and carry-over state has been published.
 
-Stopping balance can continue to run on its more frequent trigger. Before submitting recovery work, it reserves recovery-lane capacity and supersedes conflicting normal objects. Node removal or another RG-wide capacity change supersedes the whole current planning generation.
+Stopping balance continues on its existing path and retains precedence. Node removal or another RG-wide capacity change is observed as a token change and supersedes the current normal generation through reconciliation.
+
+`NewBalanceChecker` keeps its public signature. It type-asserts the concrete scheduler to both `task.BalanceTaskGenerationAdmitter` and `task.BalanceTaskInspector`; active and shadow epoch planning are unavailable unless both capabilities exist.
+
+Each tick follows this order:
+
+1. read dynamic configuration;
+2. run legacy stopping balance;
+3. call `Advance(...AllowNew=false)` once for every RG returned by `ResourceGroupsToObserve()`, including active generations and retained retry/quarantine history, regardless of feature, checker, or auto-balance enablement;
+4. if stopping work was admitted, do not start a new normal epoch;
+5. evaluate checker activation, auto-balance, interval, active/shadow mode, and policy support;
+6. collect eligible collections/replicas, group them by RG, and sort collection IDs, replica IDs, and RG names; and
+7. call `Advance(...AllowNew=true)` for permitted RGs, or use the legacy normal path when no active epoch needs draining.
+
+When `BalanceCheckCollectionMaxCount` truncates the eligible collection set, the checker uses a persisted round-robin cursor over the sorted collection IDs, wraps at the end, and advances only after producing a normal request. This preserves deterministic ordering without permanently starving collections outside a fixed sorted prefix.
+
+| Mode/condition | Existing active epochs | New normal work | Legacy normal balance |
+|---|---|---|---|
+| `enabled=true`, supported policy, capabilities available | Reconcile/advance | Start RG epoch | Suppressed |
+| `enabled=false`, `shadowMode=true`, no active generation | Observe retained retry history, if any | Stateless shadow snapshot/plan | Continues in the same eligible tick |
+| `enabled=false`, `shadowMode=true`, active generation exists | Reconcile/advance | No shadow until active generations drain | Suppressed until no active generation remains |
+| Feature disabled, checker active, `autoBalance=true` | Reconcile/advance | Forbidden | Resumes after active generations drain |
+| Checker inactive or `autoBalance=false` | Reconcile/advance | Forbidden | Forbidden |
+| Unsupported policy or missing optional capability with normal balance enabled | Reconcile/advance if owned state exists | Forbidden | Used after drain |
+| Stopping work admitted this tick | Reconcile/advance | Forbidden | No new normal work this tick |
+
+Rows are evaluated in this priority order: accepted stopping work and active-generation drain; checker/auto-balance/interval gate; active epoch mode; shadow mode; legacy fallback. If both `enabled` and `shadowMode` are true, active mode wins and no shadow/legacy plan is produced. Retained retry history without an active generation is still observed, but it does not by itself suppress shadow or legacy normal balance.
+
+Shadow planning is stateless but not silent. If it computes a wave and the deadline or context becomes terminal immediately afterward, the returned result and `shadow=true` log retain the planned count and observed/projected objectives, and the shadow plan/objective metrics are still published. Shadow never calls generation admission or creates an active runtime.
+
+Legacy `submitTasks` must count only successful `Scheduler.Add` calls and log every admission error. Generated task slice length is not accepted-work accounting.
 
 ### Observability
 
-The implementation should expose at least:
+The MVP registers these Prometheus collectors:
 
-- active epoch ID and state per RG;
-- epoch duration and reconciliation duration;
-- snapshot retries and invalidation reasons;
-- planned, admitted, rejected, running, waiting-distribution, completed, and failed task counts;
-- admission rejection reasons;
-- epoch completion state and reason;
-- number of normal epochs preempted by stopping/recovery;
-- count and age of tasks carried over from older generations;
-- quarantined object and node counts with reasons;
-- number and age of ambiguous RPC outcomes;
-- number of redundant copies left after partial moves; and
-- convergence age per RG.
+| Metric | Collector and label contract |
+|---|---|
+| `milvus_querycoord_balance_epoch_active{resource_group,state}` | `GaugeVec`; state is `planning`, `admitting`, `executing`, or `reconciling`. A transition deletes the previous state label before setting the new one; terminal publication deletes the last active-state label. |
+| `milvus_querycoord_balance_epoch_total{resource_group,result}` | `CounterVec`; active-generation result is `converged`, `completed`, `degraded`, `superseded`, `timed_out`, or `snapshot_error`, published exactly once. Stateless shadow runs do not increment it. |
+| `milvus_querycoord_balance_epoch_plans_total{resource_group,kind,result}` | `CounterVec`; kind is `segment` or `channel`; result is `planned`, `reserved`, `rejected`, `unattempted`, or `shadow`. |
+| `milvus_querycoord_balance_epoch_admission_total{resource_group,reason}` | `CounterVec`; reason uses the stable `BalanceAdmissionReason.String()` values. Shadow does not admit and therefore does not increment it. |
+| `milvus_querycoord_balance_epoch_snapshot_retries_total{resource_group}` | `CounterVec`; increment once at the start of every optimistic attempt after the first. |
+| `milvus_querycoord_balance_epoch_objective{resource_group,phase}` | `GaugeVec`; phase is `observed`, `projected`, `committed`, or `shadow`. Values are replaced with the latest applicable generation/run; an accepted prefix updates `committed`. |
+| `milvus_querycoord_balance_epoch_carry_over{resource_group,kind}` | `GaugeVec`; kind is `segment` or `channel`. It counts active admitted objects, ambiguous carry-over, and unexpired quarantine. A zero count deletes that label; retained below-threshold retry history remains observable without appearing as carry. |
+| `milvus_querycoord_balance_epoch_duration_seconds{resource_group,result}` | `HistogramVec` using `prometheus.DefBuckets`; one observation is published with each active terminal counter result. |
 
-Logs for each plan should include RG, epoch ID, collection, replica, shard, segment/channel, source, target, admission result, and terminal outcome.
+The MVP logs planned, admitted, rejected, terminal, timed-out, and carry-over outcomes with RG, epoch term/sequence, collection, replica, shard, segment/channel, source, target, admission reason, and objective values. More detailed redundant-copy age, ambiguous-RPC age, and recovery-preemption metrics are follow-up observability.
 
 ## Public Interfaces
 
-This proposal does not change the Milvus user-facing API.
+This implementation does not change the Milvus user-facing API.
 
-Internal interfaces will be added or extended to support:
+Internal interfaces are added or extended to support:
 
-- snapshot version tuples;
+- atomic primitive distribution capture;
+- immutable placement snapshots and admission tokens;
 - RG and epoch metadata on balance tasks;
-- task terminal/admission notifications or equivalent polling APIs;
-- typed admission results and recovery-versus-normal admission classes;
-- cancellation of not-started tasks by epoch/object scope;
-- epoch invalidation events for RG, replica, target, node, and leader changes; and
-- epoch status in QueryCoord diagnostics.
+- `Task.Done()` terminal notification;
+- optional distribution-aware channel delta and pending-task inspection;
+- typed held admission on the concrete scheduler;
+- snapshot-only planning and hard RG wave reservations; and
+- a tick-driven `BalanceEpochController` used by `BalanceChecker`.
 
-Configuration should include:
+Configuration is dynamic and defaults to a non-disruptive rollout:
 
-```text
-queryCoord.balanceEpoch.enabled
-queryCoord.balanceEpoch.deadline
-queryCoord.balanceEpoch.noProgressDeadline
-queryCoord.balanceEpoch.maxSegmentTasks
-queryCoord.balanceEpoch.maxChannelTasks
-queryCoord.balanceEpoch.maxTasksPerNode
-queryCoord.balanceEpoch.maxTasksPerCollection
-queryCoord.balanceEpoch.maxObjectRetries
-queryCoord.balanceEpoch.quarantineBackoff
-```
+| Key | Default | Meaning |
+|---|---:|---|
+| `queryCoord.balanceEpoch.enabled` | `false` | Route supported normal policies through active epochs. |
+| `queryCoord.balanceEpoch.shadowMode` | `false` | Snapshot and plan without typed admission; legacy normal balance still runs. |
+| `queryCoord.balanceEpoch.deadline` | `120000` ms | Overall epoch deadline. |
+| `queryCoord.balanceEpoch.noProgressDeadline` | `30000` ms | Reconcile when relevant placement makes no progress. |
+| `queryCoord.balanceEpoch.maxSegmentTasks` | `5` | Hard segment-task cap; fallback order is `queryCoord.balanceSegmentBatchSize`, then deprecated `queryCoord.collectionBalanceSegmentBatchSize`. |
+| `queryCoord.balanceEpoch.maxChannelTasks` | `1` | Hard channel-task cap; fallback order is `queryCoord.balanceChannelBatchSize`, then deprecated `queryCoord.collectionBalanceChannelBatchSize`. |
+| `queryCoord.balanceEpoch.maxTasksPerNode` | `5` | Hard placement-action cap per source or target node. |
+| `queryCoord.balanceEpoch.maxTasksPerCollection` | `5` | Hard per-collection cap within one RG wave. |
+| `queryCoord.balanceEpoch.maxObjectRetries` | `3` | Consecutive known failures before quarantine. |
+| `queryCoord.balanceEpoch.quarantineBackoff` | `60000` ms | Backoff before a quarantined object becomes eligible again. |
 
-Existing balance batch-size settings can be used as initial defaults for the epoch limits. The epoch layer treats them as hard limits.
+All ten keys are refreshable. An epoch-specific batch value overrides both fallback keys; resetting it restores the current key, then the deprecated key, then the documented default. Zero or negative task limits allow no new work for that dimension; they are not interpreted as unlimited.
 
 ## Compatibility, Deprecation, and Migration Plan
 
@@ -771,34 +1262,99 @@ The minimum deliverable is deliberately limited to the normal-balance closed loo
 6. distribution-based reconciliation, deadline, and generation handoff; and
 7. planned-versus-admitted observability.
 
-Recovery admission classes, epoch-scoped cancellation, and fine-grained recovery integration are required by the final design but are delivered in the later recovery-integration phase. Resource vectors, migration byte budgets, and new placement objectives remain separate MEPs.
+Recovery admission classes, epoch-scoped cancellation, and fine-grained recovery integration are follow-up designs, not hidden requirements of this MVP. Resource vectors, migration byte budgets, and new placement objectives remain separate MEPs.
 
-Rollout is divided into phases:
+Active epoch mode is supported only for `ScoreBasedBalancer` and `ChannelLevelScoreBalancer`, subject to the Streaming Service boundaries above. Round-robin, row-count, multi-target, and any future balancer without a snapshot policy use the legacy path. They must never claim snapshot-backed epoch semantics while reading live managers.
 
-1. **Instrumentation:** add epoch-compatible task attribution and distinguish planned from admitted work without changing scheduling behavior.
-2. **Shadow planning:** build RG snapshots and waves, but compare plans and budgets without admitting epoch-generated tasks.
-3. **Normal-balance epoch:** route normal balance through one epoch per RG while preserving the configured existing balance policy.
-4. **Recovery integration:** allow stopping and recovery events to preempt/invalidate normal epochs through the common manager.
-5. **Default enablement:** enable RG epochs by default after upgrade, failure, and scale tests demonstrate no convergence regression.
+Rollout is divided into explicit stages:
 
-During rollout, disabling `queryCoord.balanceEpoch.enabled` stops creation of new epochs. The current generation first publishes reconciled and carry-over state; only then does QueryCoord restore the existing periodic normal-balance submission path. In-flight scheduler tasks continue to use existing safety and deduplication semantics. Epoch task metadata must be ignored safely by older QueryNodes because epoch orchestration remains inside QueryCoord.
+| Stage | Status in this change | Behavior |
+|---|---|---|
+| Instrumentation | Implemented | Epoch attribution, planned/admitted accounting, lifecycle metrics, and snapshot retry observation are present while active mode remains off by default. |
+| Shadow planning | Implemented, opt-in | With active mode disabled and shadow enabled, build RG snapshots/waves without admission or runtime state, then run legacy normal balance in the same eligible tick. |
+| Normal-balance epoch | Implemented, opt-in | Route supported normal policies through one epoch per RG. Active mode takes precedence over shadow. |
+| Recovery integration | Follow-up | Add explicit recovery admission classes, object-scoped preemption, and common capacity reservation. Existing stopping/recovery paths retain priority in the MVP. |
+| Default enablement | Follow-up | Consider changing the default only after upgrade, failure-injection, scale, and production-shadow evidence shows no convergence or availability regression. |
+
+During rollout, disabling `queryCoord.balanceEpoch.enabled` stops creation of new epochs. QueryCoord continues one observation `Advance` per active RG and restores legacy normal balance only after `ActiveResourceGroups()` is empty and the checker/`autoBalance` gates permit it. A terminal RG is not restarted in the same tick. Retained retry/quarantine state continues observation but does not suppress legacy fallback once no generation is active. In-flight scheduler tasks continue to use existing safety and deduplication semantics. Epoch task metadata remains inside QueryCoord and does not require a QueryNode protocol change.
 
 Mixed-version QueryNode deployments are supported because the first version of the epoch protocol relies on existing distribution fields. Future resource-vector extensions require their own compatibility design.
 
-## Test Plan
+### Verified implementation evidence
+
+Behavioral tests were run at final implementation commit `6b3c870d30efa660955b0a1b1c3806c310d34728` on the approved `mini` macOS development host. Every accepted run sourced `scripts/setenv.sh`, supplied the repository native-library RPATH, used a fresh isolated no-auth etcd/local-storage directory, preserved the direct Go test exit code, and verified process, port, and data-directory cleanup.
+
+The final focused selectors were:
+
+```bash
+go test -gcflags="all=-N -l" -ldflags="-r ${RPATH}" -tags dynamic,test \
+  ./internal/querycoordv2/task \
+  -run 'TestTask/(TestChannelTaskDeltaSnapshot|TestAdmitBalanceTask|TestTaskDone)' -count=1
+
+go test -gcflags="all=-N -l" -ldflags="-r ${RPATH}" -tags dynamic,test \
+  ./internal/querycoordv2/balance \
+  -run 'Test(PlacementSnapshot|WaveLedger|ProjectedPlacement|ScoreEpochPolicy|ChannelLevelEpochPolicy|EpochManager|BalanceEpoch)' -count=1
+
+go test -gcflags="all=-N -l" -ldflags="-r ${RPATH}" -tags dynamic,test \
+  ./internal/querycoordv2/checkers \
+  -run 'TestBalanceChecker|TestCheckControllerSuite' -count=1
+
+cd pkg
+go test ./util/paramtable -run 'TestComponentParam_BalanceEpoch' -count=1
+go test ./metrics -run 'TestQueryCoordBalanceEpochMetrics' -count=1
+```
+
+Results were respectively `0.951s`, `0.833s`, `1.297s`, `0.457s`, and `0.269s`, all exit `0`. The `pkg` commands are run from the nested `pkg` Go module; the superficially similar root-module paths are invalid and are not counted as test evidence.
+
+The final complete QueryCoord command was:
+
+```bash
+source scripts/setenv.sh
+go test -timeout 300s -gcflags="all=-N -l" -ldflags="-r ${RPATH}" \
+  -tags dynamic,test ./internal/querycoordv2/... -count=1
+```
+
+Every QueryCoord package passed. The main package completed in `108.398s`; notable package results include `balance` `2.636s`, `checkers` `5.705s`, `dist` `17.246s`, `meta` `14.795s`, `observers` `29.071s`, and `task` `21.939s`. The preserved command exit was `0`, followed by confirmed temporary-etcd process, port, and data cleanup. Local `gofmt`, `git diff --check`, and balance test-binary compilation also exited `0`.
+
+### #51244 static-target convergence fixture
+
+`TestBalanceEpochIssue51244StaticTargetConverges` uses the production `scoreEpochPolicy`, `BalanceEpochManager`, `PlacementSnapshotBuilder`, and authoritative `DistributionManager`, with a deterministic generation-aware admission seam at the external scheduler boundary. It does not script successive waves. The retained sequence is:
+
+```text
+epoch 1: potential 68550 -> 48750, 2 planned / 2 admitted
+epoch 2: potential 48750 -> 16550, 2 planned / 2 admitted
+epoch 3: potential 16550 ->  5550, 1 planned / 1 admitted
+epoch 4: potential  5550 ->  5550, 0 planned / 0 admitted, Converged
+
+moves: segment 110 1->3, 111 1->3, 112 1->3, 113 1->3, 114 1->3
+```
+
+The fixture proves every committed-prefix potential is non-increasing across observations and strictly decreasing when work is admitted, every planned task is admitted with no rejected suffix, all wave budgets hold, no replica-scoped object is concurrent, no object moves `A -> B -> A`, and admitted move count reaches zero at the fixed point. The nonzero final potential is expected: convergence means no legal strict improvement, not zero mathematical variance.
+
+Five companion fixtures prove delayed Grow locking, successful-prefix retention across failed Grow/Reduce, unrelated-collection progress around ambiguous carry, per-RG manager-lock isolation, and hard segment/channel/collection/node budgets across two collections and replicas. The channel fixture also found and fixed the execution-time `LeaderHash` self-supersession defect described above.
+
+## Verified Test Coverage
 
 ### Unit tests
 
 - Snapshot construction retries when any member of the version tuple changes.
+- Unrelated RG distribution and pending-task churn does not retry or invalidate this RG; relevant same-RG changes still do.
+- Two independent tasks from one wave can advance the RG pending token and both be admitted; a same-RG external mutation between admissions rejects the suffix.
+- Advancing target state between sealed-segment and channel reads forces a retry; accepted target content and version come from one generation.
+- Unowned segment/channel placement on an RG physical node and NilReplica cleanup effects are counted exactly once until distribution removes them.
+- Blocking one collection's target refresh does not block another collection's task add or pending snapshot inspection.
+- Every balance-epoch config key has the documented default and refreshes through `Save`/`Reset`; active generations retain frozen creation-time values.
+- All eight collectors register once; active-state transitions delete the previous state label, terminal counters/durations publish exactly once, objective phases retain the latest observation, and carry labels are removed when their count reaches zero.
 - Returned snapshot maps and slices are isolated from distribution-manager mutation.
 - One RG cannot run two planning/admission generations concurrently.
-- Different RGs can plan and execute concurrently.
+- Different RG `Advance` calls use independent runtime locks; a blocked RG-A call does not block RG-B from converging or starting work.
 - Old-generation safe-settle tasks remain locked and reserved while the current generation plans unrelated objects.
 - Hard task limits cannot be exceeded by multiple collections, replicas, shards, or outbound nodes.
 - Only successfully admitted tasks count toward epoch completion and budget.
+- A mid-wave rejection stops the suffix; `ObjectiveAfter` and metrics use the accepted-prefix potential, not the full planned wave.
 - Deterministic plan ordering produces the same wave for the same snapshot.
-- A wave whose aggregate objective improvement is below the threshold is rejected even when its individual plans pass local benefit checks.
-- `Converged` uses the same objective and threshold as wave admission.
+- A wave whose aggregate objective does not pass `ScorePotential.Improves` is rejected even when its individual plans pass local benefit checks.
+- `Converged` uses the same strict potential comparison as wave admission.
 - Duplicate and stale plans are rejected without corrupting reservations.
 - Epoch deadline transitions through reconciliation before `TimedOut`.
 
@@ -809,12 +1365,14 @@ Mixed-version QueryNode deployments are supported because the first version of t
 - Grow fails before target presence: source remains and epoch becomes `Degraded`.
 - Grow RPC times out but target later appears: reconciliation recognizes success.
 - Reduce fails after target presence: redundant copy remains and epoch becomes `Degraded`.
+- Cancelled, timed-out, unavailable, or lost-response Reduce with source+target both present remains locked; a delayed source disappearance later reconciles as completed.
+- Ambiguous Reduce with both source and target absent remains locked for normal balance while availability repair proceeds; it is not misclassified as a definitive missing-placement quarantine.
 - Node failure and RG membership change supersede the RG generation.
-- A collection target change or leader change invalidates only its collection/replica/shard scope.
-- Stopping balance preempts normal balance without violating Grow-before-Reduce.
+- A collection target, replica, node-eligibility, or pre-admission leader change stops the remaining suffix and transitions through reconciliation.
+- Execution tolerates `StaleEpoch` and post-admission leader publication while RG/node/replica/target invalidation still supersedes.
+- Stopping balance prevents creation of a new normal epoch while active epochs continue observation and reconciliation.
 - The epoch's own distribution updates do not self-invalidate the generation.
 - Unrelated RG distribution updates do not invalidate the snapshot scope.
-- QueryCoord restart discards projected epoch state and replans after distribution recovery.
 
 ### Integration tests
 
@@ -825,17 +1383,40 @@ Mixed-version QueryNode deployments are supported because the first version of t
 - Scheduler admission rejection is visible in epoch accounting and does not suppress future planning indefinitely.
 - Distribution pull delay between Grow and Reduce does not create a reverse move for the same segment.
 - One failed task does not roll back unrelated successful moves.
-- One failed RG epoch does not block epochs in other RGs.
-- Recovery supersedes conflicting normal objects without cancelling already-running actions unsafely.
+- One RG's stuck or failed epoch does not block another RG.
+- Shadow mode produces snapshot/plan/objective metrics, performs zero typed admissions, installs no locks/reservations/runtime state, and leaves legacy normal balance enabled when no active generation is draining.
 
-### Long-running and failure-injection tests
+The issue-#51244 static-target fixture records every `(replica, object, from, to)` admission across repeated checker ticks and asserts:
+
+1. score potential never increases at an admitted wave boundary;
+2. new admissions never exceed the wave's kind/collection caps, and pending plus carry-over node reservations never exceed the per-node capacity cap;
+3. the same replica-scoped object is never admitted concurrently;
+4. successful moves remain successful when another task fails;
+5. admitted move count eventually reaches zero under static topology and targets; and
+6. no zero-net `A -> B -> A` cycle is admitted under the static snapshot sequence.
+
+### Follow-up validation not claimed by this change
 
 - Repeated QueryNode restarts and shard-leader changes while normal balance is active.
 - RG scale-out and scale-in near balance trigger boundaries.
 - Object-storage load failures and resource-exhaustion responses.
 - Lost RPC responses where QueryNode applies the operation successfully.
-- A production-scale distribution modeled after issue #51244, verifying bounded in-flight work and the absence of repeated reverse moves under a static target.
-- Under a static target and topology, admitted move count and objective improvement decay across epochs until no further wave is admitted.
+- A production-scale distribution modeled after issue #51244, beyond the deterministic retained fixture, verifying bounded in-flight work and the absence of repeated reverse moves under a static target.
+- QueryCoord process restart during active execution, verifying that recovered distribution—not in-memory epoch state—drives the next plan.
+
+### Final validation commands
+
+Focused task, balance, checker, configuration, and metric tests run first with selectors shown in the evidence section. The complete behavioral gate actually run on `mini` is:
+
+```bash
+source scripts/setenv.sh
+go test -timeout 300s -gcflags="all=-N -l" -ldflags="-r ${RPATH}" -tags dynamic,test \
+  ./internal/querycoordv2/... -count=1
+
+git diff --check 4dbaba0042d3952fa75bbb5d2fb9606c6b67f44d...HEAD
+```
+
+The implementation PR will record the same host, final commit, focused selectors, full command, exit code, package timings, and isolated-etcd cleanup evidence.
 
 ## Rejected Alternatives
 
@@ -862,6 +1443,15 @@ Rolling back every successful move after one task fails would create additional 
 ### Persist in-progress epochs
 
 Persisting projected placement and action state introduces recovery complexity and can conflict with the authoritative QueryNode distribution after failover. The first version rebuilds from target, topology, scheduler state, and recovered distribution instead.
+
+## Delivery Sequence
+
+This feature uses a design-first two-commit cross-link flow:
+
+1. Commit and push this implementation-aligned MEP, then open the design-doc PR. The Milvus implementation PR is still pending at that point, as recorded in the document header.
+2. Push the feature branch only to `xiaofanluan/milvus` and open a draft PR to `milvus-io/milvus:master`. Its body links the design-doc PR, states that active rollout defaults to disabled, and includes the verified focused/full test evidence.
+3. Add a follow-up commit to the design-doc branch replacing the pending implementation-PR prose with the new Milvus PR URL.
+4. Verify that both PRs cross-link before review handoff.
 
 ## References
 
