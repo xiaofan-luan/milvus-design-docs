@@ -2,13 +2,13 @@
 
 - **Created:** 2026-07-12
 - **Last Updated:** 2026-07-15
-- **Author(s):** @xiaofanluan
+- **Author(s):** @xiaofan-luan
 - **Status:** Draft
 - **Component:** Coordinator
 - **Related Issues:** [milvus-io/milvus#51244](https://github.com/milvus-io/milvus/issues/51244)
 - **Related Pull Requests:** [milvus-io/milvus#49861](https://github.com/milvus-io/milvus/pull/49861), [milvus-io/milvus#50774](https://github.com/milvus-io/milvus/pull/50774)
 - **Implementation Baseline:** `milvus-io/milvus@4dbaba0042d3952fa75bbb5d2fb9606c6b67f44d`
-- **Implementation Branch:** `xiaofanluan/milvus:feature/resource-group-balance-epoch` at `5db539d20c4787087386b33347191083a07b9d3c`
+- **Implementation Branch:** `xiaofan-luan/milvus:feature/resource-group-balance-epoch` at `8c7b55f32cdf031ead70e99afdace281434761bb`
 - **Implementation Pull Request:** The draft Milvus PR will be opened after the design-doc PR so the implementation can link the published MEP; this line will be updated with that URL in a follow-up design-doc commit.
 - **Released:** Not released
 
@@ -40,7 +40,7 @@ This MEP changes the orchestration and correctness boundary of balancing. It doe
 
 ## Implementation Status
 
-The MVP described by this MEP is implemented and reviewed on the Milvus feature branch. Relative to baseline `4dbaba0042d3952fa75bbb5d2fb9606c6b67f44d`, final implementation commit `5db539d20c4787087386b33347191083a07b9d3c` contains 19 feature commits and changes 38 files. Its exact tree is `fa0a7b9a4ecb7221b044ac66bf493dbd5a50ca3b`. Active rollout remains disabled by default, and the implementation PR has not yet been opened because delivery follows the design-first sequence described below.
+The MVP described by this MEP is implemented and reviewed on the Milvus feature branch. Relative to baseline `4dbaba0042d3952fa75bbb5d2fb9606c6b67f44d`, final implementation commit `8c7b55f32cdf031ead70e99afdace281434761bb` contains 22 commits and changes 39 files, including 38 Go files. Its exact tree is `bf66602b87ebde3dd1332cce9fa956d1a08864e9`. Active rollout remains disabled by default, and the implementation PR has not yet been opened because delivery follows the design-first sequence described below.
 
 | Layer | Status | Milvus commits | Main files |
 |---|---|---|---|
@@ -55,8 +55,13 @@ The MVP described by this MEP is implemented and reviewed on the Milvus feature 
 | Metrics, shadow mode, and retained-state observation | Implemented and reviewed | `ba3b96816b`, `13f81066a6` | `pkg/metrics/querycoord_metrics.go`, checker and manager files |
 | #51244 convergence and failure fixtures | Implemented and reviewed | `b454240dc6` | `balance/epoch_manager_test.go` |
 | Ambiguous balance RPC outcome preservation | Implemented and reviewed | `5db539d20c` | `session/rpc_outcome.go`, `session/cluster.go`, `task/execution_outcome.go`, `task/executor.go`, `balance/epoch_manager.go` |
+| Dist controller start-loop synchronization | Test-only validation stabilization | `6b3a211127` | `dist/dist_controller_test.go` |
+| Typed balance-epoch error classification | Review fix; no new control-loop architecture | `0db483db33` | `balance/epoch_manager.go`, `epoch_snapshot.go`, `epoch_wave.go`, and focused tests |
+| Unused server snapshot-builder wiring removal | Review cleanup; manager-owned builder unchanged | `8c7b55f32c` | `server.go`, `server_test.go` |
 
-The final full `internal/querycoordv2/...` run is green on the approved `mini` macOS development host with the repository native-library RPATH and isolated temporary etcd. The final task review reported zero Critical, Important, or Minor findings. The local worktree can compile the affected Go tests but cannot execute them with the required Milvus dynamic-library RPATH, so behavioral evidence is explicitly attributed to `mini` rather than to the local machine.
+Commit `6b3a211127` synchronizes only the dist controller test start loops so the validation fixture waits for both goroutines; it does not change production distribution behavior. Commit `0db483db33` replaces 21 branch-originated raw production errors with typed `merr` origins: 17 invariant/protocol failures use the `ErrServiceInternal` family, while four transient cases use retriable `ErrServiceUnavailable`; the unresolved-ambiguity path preserves the prior cause as an `errors.Join` sibling. Commit `8c7b55f32c` removes the unused server-owned snapshot-builder field, construction, and assertion while leaving the manager-owned builder unchanged. These review fixes refine diagnostics and construction ownership without changing the epoch protocol described by this MEP.
+
+The final focused, race, and complete `internal/querycoordv2/...` behavioral runs are green on the approved `mini` macOS development host with the repository native-library RPATH and isolated temporary etcd. The final re-review reported zero Critical, Important, or Minor findings. Branch-added raw-constructor scans found zero production origins, and the scoped balance-package ruleguard run reported `rawmerrerror: 0`. Repository-wide `make static-check` is not claimed green: it stops during core-package typechecking, before ruleguard, because this checkout lacks the unchanged generated package `cmd/tools/migration/legacy/legacypb`.
 
 ## Motivation
 
@@ -1308,9 +1313,38 @@ Mixed-version QueryNode deployments are supported because the first version of t
 
 ### Verified implementation evidence
 
-Behavioral tests were run at final implementation commit `5db539d20c4787087386b33347191083a07b9d3c` on the approved `mini` macOS development host. Every accepted run sourced `scripts/setenv.sh`, supplied the repository native-library RPATH, used a fresh isolated no-auth etcd/local-storage directory, preserved the direct Go test exit code, and verified process, port, and data-directory cleanup.
+Verification targets final implementation commit `8c7b55f32cdf031ead70e99afdace281434761bb`, tree `bf66602b87ebde3dd1332cce9fa956d1a08864e9`, relative to baseline `4dbaba0042d3952fa75bbb5d2fb9606c6b67f44d`. The range contains 22 commits, changes 39 files including 38 Go files, and passes the 22/22 final-trailer DCO audit. NUL-safe `gofmt -d` over the changed Go files emitted no diff, and `git diff --check` exited `0`.
 
-The final focused selectors were:
+Added-line scans over branch-modified non-test Go code and direct scans of `epoch_manager.go`, `epoch_snapshot.go`, and `epoch_wave.go` found zero production origins using `fmt.Errorf`, `errors.New`, `errors.Newf`, or `errors.Errorf`. The repository-configured scoped lint command reached the affected balance package and produced:
+
+```text
+FINAL8C7_SCOPED_LINT_EXIT=1
+FINAL8C7_RAWMERRERROR_COUNT=0
+14 issues:
+* depguard: 2
+* gci: 1
+* staticcheck: 11
+```
+
+The nonzero scoped exit therefore is not a clean lint result; its narrower evidence is that ruleguard reported `rawmerrerror: 0`. Repository-wide `make static-check` is also not claimed passing. It exited `2` during core-package typechecking, before ruleguard, because the checkout lacks the unchanged generated migration package:
+
+```text
+cmd/tools/migration/meta/210_to_220.go:12:2: could not import
+github.com/milvus-io/milvus/cmd/tools/migration/legacy/legacypb
+
+no required module provides package
+github.com/milvus-io/milvus/cmd/tools/migration/legacy/legacypb
+
+1 issues:
+* typecheck: 1
+make: *** [static-check] Error 1
+```
+
+Because the repository-wide target did not reach ruleguard, it supplies no `rawmerrerror` evidence. The scoped command is the direct evidence for that rule. The same missing generated-package blocker existed before and after the final review-fix commits.
+
+Behavioral tests were run on the approved `mini` macOS development host. Every accepted run sourced `scripts/setenv.sh`, supplied the repository native-library RPATH, used a fresh isolated no-auth etcd/local-storage directory, preserved the direct Go test exit code, and verified process, port, and data-directory cleanup.
+
+The final focused matrix contained nine commands:
 
 ```bash
 go test -timeout 120s -gcflags="all=-N -l" -ldflags="-r ${RPATH}" -tags dynamic,test \
@@ -1319,28 +1353,81 @@ go test -timeout 120s -gcflags="all=-N -l" -ldflags="-r ${RPATH}" -tags dynamic,
 
 go test -timeout 120s -gcflags="all=-N -l" -ldflags="-r ${RPATH}" -tags dynamic,test \
   ./internal/querycoordv2/task \
-  -run 'TestTask/(TestExecutorRaw.*ErrorIsAmbiguous|TestExecutorRPCNotSentReleaseErrorIsDefinitive|TestExecutorNonOKReleaseStatusIsDefinitive)' -count=1
+  -run 'TestTask/(TestExecutorRawLoadSegmentsErrorIsAmbiguous|TestExecutorRawReleaseSegmentsErrorIsAmbiguous|TestExecutorRawWatchDmChannelsErrorIsAmbiguous|TestExecutorRawUnsubDmChannelErrorIsAmbiguous|TestExecutorRPCNotSentReleaseErrorIsDefinitive|TestExecutorNonOKReleaseStatusIsDefinitive)' -count=1
 
 go test -timeout 120s -gcflags="all=-N -l" -ldflags="-r ${RPATH}" -tags dynamic,test \
   ./internal/querycoordv2/balance \
   -run 'Test(EpochManagerAmbiguousRPCFailureRetainsReservationsUntilAuthoritativePlacementSettles|EpochManagerFailedStatusBeforeDoneIsAmbiguous)' -count=1
+
+go test -timeout 120s -gcflags="all=-N -l" -ldflags="-r ${RPATH}" -tags dynamic,test \
+  ./internal/querycoordv2/task \
+  -run 'TestTask/(TestChannelTaskDeltaSnapshot|TestAdmitBalanceTask|TestTaskDone)' -count=1
+
+go test -timeout 120s -gcflags="all=-N -l" -ldflags="-r ${RPATH}" -tags dynamic,test \
+  ./internal/querycoordv2/balance \
+  -run 'Test(PlacementSnapshot|WaveLedger|ProjectedPlacement|ScoreEpochPolicy|ChannelLevelEpochPolicy|EpochManager|BalanceEpoch)' -count=1
+
+go test -timeout 120s -gcflags="all=-N -l" -ldflags="-r ${RPATH}" -tags dynamic,test \
+  ./internal/querycoordv2/checkers \
+  -run 'TestBalanceChecker|TestCheckControllerSuite' -count=1
+
+go test -timeout 120s -gcflags="all=-N -l" -ldflags="-r ${RPATH}" -tags dynamic,test \
+  ./internal/querycoordv2/dist \
+  -run 'TestDistControllerSuite/TestStart' -count=1
+
+cd pkg
+go test ./util/paramtable -run 'TestComponentParam_BalanceEpoch' -count=1
+go test ./metrics -run 'TestQueryCoordBalanceEpochMetrics' -count=1
 ```
 
 The exact accepted package results were:
 
 ```text
-ok  github.com/milvus-io/milvus/internal/querycoordv2/session  0.738s
-SESSION_FOCUSED_EXIT=0
-ok  github.com/milvus-io/milvus/internal/querycoordv2/task     0.806s
-TASK_FOCUSED_EXIT=0
-ok  github.com/milvus-io/milvus/internal/querycoordv2/balance  0.744s
-BALANCE_FOCUSED_EXIT=0
-GREEN2_PROCESS_CLEAR=1
-GREEN2_PORTS_CLEAR=1
-GREEN2_DATA_CLEAR=1
+ok  github.com/milvus-io/milvus/internal/querycoordv2/session   0.733s
+FINAL8C7_FOCUS_SESSION_EXIT=0
+ok  github.com/milvus-io/milvus/internal/querycoordv2/task      0.827s
+FINAL8C7_FOCUS_AMBIG_TASK_EXIT=0
+ok  github.com/milvus-io/milvus/internal/querycoordv2/balance   0.753s
+FINAL8C7_FOCUS_AMBIG_BALANCE_EXIT=0
+ok  github.com/milvus-io/milvus/internal/querycoordv2/task      0.836s
+FINAL8C7_FOCUS_TASK_EXIT=0
+ok  github.com/milvus-io/milvus/internal/querycoordv2/balance   0.856s
+FINAL8C7_FOCUS_BALANCE_EXIT=0
+ok  github.com/milvus-io/milvus/internal/querycoordv2/checkers  1.312s
+FINAL8C7_FOCUS_CHECKERS_EXIT=0
+ok  github.com/milvus-io/milvus/internal/querycoordv2/dist      5.794s
+FINAL8C7_FOCUS_DIST_EXIT=0
+ok  github.com/milvus-io/milvus/pkg/v3/util/paramtable          0.321s
+FINAL8C7_FOCUS_PARAMTABLE_EXIT=0
+ok  github.com/milvus-io/milvus/pkg/v3/metrics                  0.272s
+FINAL8C7_FOCUS_METRICS_EXIT=0
+focused remote wrapper exit=0
+FINAL8C7_FOCUS_PROCESS_CLEAR=1
+FINAL8C7_FOCUS_PORTS_CLEAR=1
+FINAL8C7_FOCUS_DATA_CLEAR=1
 ```
 
-The focused wrappers exited `0`. Earlier implementation gates also covered `BalanceChecker`, all ten refreshable configuration keys, and all eight metric collectors; commit `5db539d20c` changes only the session/task/balance RPC-outcome boundary, so the final focused run targets that changed correctness surface and the final whole-QueryCoord run covers the complete internal component tree.
+All nine focused commands exited `0`. The matrix covers RPC outcome typing, task admission/delta/completion, snapshot/wave/policy/manager behavior, checker integration, the synchronized dist `TestStart` fixture, all ten refreshable configuration keys, and all eight metric collectors.
+
+The prescribed balance race selector also passed:
+
+```bash
+go test -race -ldflags="-r ${RPATH}" -tags dynamic,test \
+  ./internal/querycoordv2/balance \
+  -run 'Test(EpochManagerAmbiguousRPCFailureRetainsReservationsUntilAuthoritativePlacementSettles|EpochManagerFailedStatusBeforeDoneIsAmbiguous)' \
+  -count=1
+```
+
+```text
+ok  github.com/milvus-io/milvus/internal/querycoordv2/balance  1.931s
+FINAL8C7_RACE_BALANCE_EXIT=0
+race remote wrapper exit=0
+FINAL8C7_RACE_PROCESS_CLEAR=1
+FINAL8C7_RACE_PORTS_CLEAR=1
+FINAL8C7_RACE_DATA_CLEAR=1
+```
+
+No race report was emitted.
 
 The final complete QueryCoord command was:
 
@@ -1353,44 +1440,27 @@ go test -timeout 300s -gcflags="all=-N -l" -ldflags="-r ${RPATH}" \
 The exact accepted output was:
 
 ```text
-FULL_ETCD_HEALTHY=1
-ok  github.com/milvus-io/milvus/internal/querycoordv2            107.377s
-ok  github.com/milvus-io/milvus/internal/querycoordv2/assign       2.032s
-ok  github.com/milvus-io/milvus/internal/querycoordv2/balance      2.682s
-ok  github.com/milvus-io/milvus/internal/querycoordv2/checkers     5.825s
-ok  github.com/milvus-io/milvus/internal/querycoordv2/dist        16.672s
-ok  github.com/milvus-io/milvus/internal/querycoordv2/job          3.991s
-ok  github.com/milvus-io/milvus/internal/querycoordv2/meta        14.709s
-?   github.com/milvus-io/milvus/internal/querycoordv2/mocks       [no test files]
-ok  github.com/milvus-io/milvus/internal/querycoordv2/observers   27.465s
-?   github.com/milvus-io/milvus/internal/querycoordv2/params      [no test files]
-ok  github.com/milvus-io/milvus/internal/querycoordv2/session      2.835s
-ok  github.com/milvus-io/milvus/internal/querycoordv2/task        21.580s
-ok  github.com/milvus-io/milvus/internal/querycoordv2/utils        3.534s
-FULL_QUERYCOORD_EXIT=0
-FULL_PROCESS_CLEAR=1
-FULL_PORTS_CLEAR=1
-FULL_DATA_CLEAR=1
+ok   github.com/milvus-io/milvus/internal/querycoordv2            109.183s
+ok   github.com/milvus-io/milvus/internal/querycoordv2/assign       1.358s
+ok   github.com/milvus-io/milvus/internal/querycoordv2/balance      6.212s
+ok   github.com/milvus-io/milvus/internal/querycoordv2/checkers     5.969s
+ok   github.com/milvus-io/milvus/internal/querycoordv2/dist        19.951s
+ok   github.com/milvus-io/milvus/internal/querycoordv2/job          5.701s
+ok   github.com/milvus-io/milvus/internal/querycoordv2/meta        13.371s
+?    github.com/milvus-io/milvus/internal/querycoordv2/mocks       [no test files]
+ok   github.com/milvus-io/milvus/internal/querycoordv2/observers   28.001s
+?    github.com/milvus-io/milvus/internal/querycoordv2/params      [no test files]
+ok   github.com/milvus-io/milvus/internal/querycoordv2/session      3.209s
+ok   github.com/milvus-io/milvus/internal/querycoordv2/task        22.413s
+ok   github.com/milvus-io/milvus/internal/querycoordv2/utils        4.016s
+FINAL8C7_FULL_QUERYCOORD_EXIT=0
+full remote wrapper exit=0
+FINAL8C7_FULL_PROCESS_CLEAR=1
+FINAL8C7_FULL_PORTS_CLEAR=1
+FINAL8C7_FULL_DATA_CLEAR=1
 ```
 
-The remote wrapper also exited `0`.
-
-The two focused balance regressions were also run with the Go race detector:
-
-```bash
-go test -race -tags dynamic,test ./internal/querycoordv2/balance \
-  -run 'Test(EpochManagerAmbiguousRPCFailureRetainsReservationsUntilAuthoritativePlacementSettles|EpochManagerFailedStatusBeforeDoneIsAmbiguous)' -count=1
-```
-
-```text
-ok  github.com/milvus-io/milvus/internal/querycoordv2/balance  1.975s
-RACE_BALANCE_EXIT=0
-RACE_PROCESS_CLEAR=1
-RACE_PORTS_CLEAR=1
-RACE_DATA_CLEAR=1
-```
-
-Local `gofmt` over all 37 branch-modified Go files produced no diff, `git diff --check` exited `0`, and the final DCO audit found 19 commits with 19 `Signed-off-by` lines.
+Only the known non-fatal Darwin linker warnings about deprecated `-bind_at_load` and ignored duplicate native libraries were emitted. A separate follow-up after all wrappers exited again confirmed no matching processes, listeners, or run-specific temporary paths remained. The final re-review of the two review-fix commits reported zero Critical, Important, or Minor findings.
 
 ### #51244 static-target convergence fixture
 
@@ -1488,20 +1558,43 @@ The issue-#51244 static-target fixture records every `(replica, object, from, to
 
 ### Final validation commands
 
-Focused task, balance, checker, configuration, and metric tests run first with selectors shown in the evidence section. The complete behavioral gate actually run on `mini` is:
+Focused task, balance, checker, dist, configuration, and metric tests ran first with the nine selectors shown in the evidence section. The final local/static and `mini` behavioral commands were:
 
 ```bash
+git diff --name-only -z \
+  4dbaba0042d3952fa75bbb5d2fb9606c6b67f44d...HEAD -- '*.go' |
+  xargs -0 gofmt -d
+
+git diff --check \
+  4dbaba0042d3952fa75bbb5d2fb9606c6b67f44d...HEAD
+
+# No branch-added production raw constructors are expected.
+! git diff -U0 \
+  4dbaba0042d3952fa75bbb5d2fb9606c6b67f44d...HEAD -- \
+  '*.go' ':(exclude)**/*_test.go' |
+  rg '^\+[^+].*(fmt\.Errorf|errors\.(New|Newf|Errorf))'
+
+! rg -n 'fmt\.Errorf|errors\.(New|Newf|Errorf)' \
+  internal/querycoordv2/balance/epoch_manager.go \
+  internal/querycoordv2/balance/epoch_snapshot.go \
+  internal/querycoordv2/balance/epoch_wave.go
+
+source scripts/setenv.sh
+GO111MODULE=on GOFLAGS=-buildvcs=false bin/golangci-lint run \
+  --build-tags dynamic,test --timeout=30m --config .golangci.yml \
+  ./internal/querycoordv2/balance/...
+
+make static-check
+
 source scripts/setenv.sh
 go test -timeout 300s -gcflags="all=-N -l" -ldflags="-r ${RPATH}" -tags dynamic,test \
   ./internal/querycoordv2/... -count=1
 
-go test -race -tags dynamic,test ./internal/querycoordv2/balance \
+go test -race -ldflags="-r ${RPATH}" -tags dynamic,test ./internal/querycoordv2/balance \
   -run 'Test(EpochManagerAmbiguousRPCFailureRetainsReservationsUntilAuthoritativePlacementSettles|EpochManagerFailedStatusBeforeDoneIsAmbiguous)' -count=1
-
-git diff --check 4dbaba0042d3952fa75bbb5d2fb9606c6b67f44d...HEAD
 ```
 
-The implementation PR will record the same host, final commit, focused selectors, full command, exit code, package timings, and isolated-etcd cleanup evidence.
+The scoped lint command exits nonzero because of the 14 listed non-raw findings, while directly establishing `rawmerrerror: 0`. Repository-wide `make static-check` exits `2` at the unchanged missing `cmd/tools/migration/legacy/legacypb` typecheck dependency before ruleguard; it is recorded as a blocker, not as a passing verifier gate. The implementation PR will record the same host, final commit, focused selectors, full command, exact exit codes and package timings, isolated-etcd cleanup evidence, and this static-check limitation.
 
 ## Rejected Alternatives
 
@@ -1534,7 +1627,7 @@ Persisting projected placement and action state introduces recovery complexity a
 This feature uses a design-first two-commit cross-link flow:
 
 1. Commit and push this implementation-aligned MEP, then open the design-doc PR. The Milvus implementation PR is still pending at that point, as recorded in the document header.
-2. Push the feature branch only to `xiaofanluan/milvus` and open a draft PR to `milvus-io/milvus:master`. Its body links the design-doc PR, states that active rollout defaults to disabled, and includes the verified focused/full test evidence.
+2. Push the feature branch only to `xiaofan-luan/milvus` and open a draft PR to `milvus-io/milvus:master`. Its body links the design-doc PR, states that active rollout defaults to disabled, and includes the verified focused/full test evidence and the repository-wide static-check blocker.
 3. Add a follow-up commit to the design-doc branch replacing the pending implementation-PR prose with the new Milvus PR URL.
 4. Verify that both PRs cross-link before review handoff.
 
