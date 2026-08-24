@@ -2,14 +2,14 @@
 
 - **Created:** 2026-01-31
 - **Author(s):** @xiaofanluan
-- **Status:** Draft
+- **Status:** Under Review
 - **Component:** SDK | Proxy | Coordinator
-- **Related Issues:** #46934
-- **Released:** [TBD]
+- **Related Issues:** #46934, #47281
+- **Implemented by:** milvus-io/milvus#47523, milvus-io/milvus#47542, milvus-io/pymilvus#3770, milvus-io/milvus-sdk-java#2040, milvus-io/milvus-sdk-node#602, milvus-io/milvus-sdk-cpp#585
 
 ## Summary
 
-This MEP introduces a client-side telemetry system for the Go SDK that collects operational metrics, sends periodic heartbeats to the server, and supports bidirectional communication through server-pushed commands. The system provides visibility into client behavior, enables real-time monitoring through a WebUI dashboard, and allows server-initiated configuration changes.
+This MEP introduces a client-side telemetry system shared by the Go, Python, Java, Node, and C++ SDKs. It collects operational metrics, sends periodic heartbeats to the server, and supports bidirectional communication through server-pushed commands. The system provides visibility into client behavior, enables real-time monitoring through a WebUI dashboard, and allows server-initiated configuration changes.
 
 ## Motivation
 
@@ -27,13 +27,15 @@ This feature addresses these gaps by implementing a comprehensive client telemet
 
 ## Public Interfaces
 
-### Go SDK APIs
+### Client SDK configuration
+
+Each SDK exposes the following settings through its language-native client configuration. The Go type is shown as the protocol reference:
 
 ```go
 // TelemetryConfig holds configurable settings for client telemetry
 type TelemetryConfig struct {
     Enabled           bool          // Enable/disable telemetry collection
-    HeartbeatInterval time.Duration // Heartbeat frequency (default: 30s)
+    HeartbeatInterval time.Duration // Heartbeat frequency (default: 10s)
     SamplingRate      float64       // Sampling rate 0.0-1.0 (default: 1.0)
     ErrorMaxCount     int           // Max errors to track (default: 100)
 }
@@ -45,6 +47,8 @@ type ClientConfig struct {
 }
 ```
 
+The defaults are `enabled=true`, a 10-second heartbeat interval, a sampling rate of `1.0`, and an error history limit of 100 entries. The SDK creates a random client ID for each client lifecycle unless the user supplies a stable ID explicitly.
+
 ### HTTP REST APIs (Proxy)
 
 ```
@@ -53,13 +57,15 @@ POST /api/v1/telemetry/commands         - Push commands to clients
 DELETE /api/v1/telemetry/commands/{id}  - Delete a command
 ```
 
-### gRPC APIs (RootCoord)
+### gRPC APIs
 
 ```protobuf
-service RootCoord {
+service ClientTelemetryService {
     // Client heartbeat with metrics
     rpc ClientHeartbeat(ClientHeartbeatRequest) returns (ClientHeartbeatResponse);
+}
 
+service RootCoord {
     // Query connected clients
     rpc GetClientTelemetry(GetClientTelemetryRequest) returns (GetClientTelemetryResponse);
 
@@ -77,7 +83,7 @@ service RootCoord {
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                              Client (Go SDK)                                 │
+│                              Milvus Client SDK                               │
 │  ┌───────────────────────────────────────────────────────────────────────┐  │
 │  │                    ClientTelemetryManager                              │  │
 │  │  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐       │  │
@@ -89,7 +95,7 @@ service RootCoord {
 │  │           └────────────────────┼────────────────────┘                 │  │
 │  │                                ▼                                       │  │
 │  │                    ┌───────────────────────┐                          │  │
-│  │                    │   Heartbeat Loop      │───────── 30s interval    │  │
+│  │                    │   Heartbeat Loop      │───────── 10s default     │  │
 │  │                    │   (Background)        │                          │  │
 │  │                    └───────────┬───────────┘                          │  │
 │  └────────────────────────────────┼──────────────────────────────────────┘  │
@@ -268,13 +274,30 @@ Client                                      Server
    │                                           │
    │◄─── ClientHeartbeatResponse ─────────────│
    │     - Commands (pending for this client)  │
-   │     - NewConfigHash (if config changed)   │
+   │     - ServerTimestamp                     │
    │                                           │
 ```
 
-**Heartbeat interval:** 30 seconds (configurable, server can override)
+**Heartbeat interval:** 10 seconds by default (configurable, server can override)
 
-**Config hash:** SHA-256 of client configuration, used to detect when server pushes new config.
+**Config hash:** Persistent commands are sorted by `command_id`; the client hashes the concatenation of each command's ID, type, and raw payload with SHA-256 and sends the first 16 lowercase hexadecimal characters. An empty persistent set produces an empty hash.
+
+### Cross-SDK conformance contract
+
+Go is the executable reference implementation. Python, Java, Node, and C++ must preserve the following observable behavior:
+
+- `ClientInfo.reserved` contains `client_id`, string-valued `client_id_stable`, and the current `db_name`. Reconnecting reuses the same telemetry manager and client ID.
+- The worker sends one immediate heartbeat, then follows the configured interval. A heartbeat has a 10-second deadline and bypasses normal SDK RPC retry.
+- Only `Search`, `Query` (including Get), `HybridSearch`, `RunAnalyzer`, `Insert`, `Delete`, and `Upsert` are measured. One public logical SDK call produces one final outcome, including validation, retry, and result processing time. `RunAnalyzer` has no collection-level bucket.
+- Sampling uses one deterministic fixed-point accumulator shared by all operations. The sampling gate controls both metrics and error history; counts are not expanded by the inverse sampling rate.
+- Global metrics are always eligible. Collection metrics are disabled by default and are checked both when recording and when serializing a heartbeat. `"*"` enables all collections.
+- P99 uses the most recent 1,000 sampled latencies and index `min(n-1, floor(n*0.99))`. Snapshot history retains 120 windows and uses the actual previous window end.
+- Supported commands are `push_config`, `collection_metrics`, `show_errors`, `show_latency_history`, and `get_config`. Payloads are strictly typed JSON.
+- `push_config` validates the complete payload before one atomic update. Sampling is clamped to `[0,1]`; the success reply contains fixed-order `applied` keys and lexically sorted `ignored` keys.
+- Command replies remain pending across transport or business failures and are removed by successful-snapshot prefix only. Persistent command hashes and command timestamps survive reconnects.
+- Only gRPC `UNIMPLEMENTED` increases the unsupported backoff. Any real RPC response clears that streak before its business status is evaluated; other transport failures neither increase nor clear it. Backoff is capped at 30 minutes but never below the configured interval.
+
+The current reference intentionally has no heartbeat jitter. Disabling telemetry also disables its control-plane heartbeat, and command ordering uses a millisecond timestamp cursor. Changes to those behaviors require a coordinated protocol revision across all SDKs rather than a language-specific fix.
 
 ### Data Flow
 
@@ -284,7 +307,7 @@ Client                                      Server
    - Metrics stored in per-operation collectors
 
 2. **Heartbeat Cycle:**
-   - Background goroutine wakes every 30 seconds
+   - Background worker wakes every 10 seconds by default
    - Creates atomic snapshot of all metrics (resets counters)
    - Sends snapshot to RootCoord via ClientHeartbeat RPC
    - Receives and processes any pending commands
