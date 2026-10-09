@@ -5,6 +5,7 @@
 - **Status:** Draft
 - **Component:** Proxy, Index, QueryNode, DataNode, Coordinator
 - **Related PR:** https://github.com/milvus-io/milvus/pull/53972
+- **Design document:** https://github.com/xiaofan-luan/milvus-design-docs/blob/design/nan-total-order-53972/design_docs/20261009-nan-total-order.md
 
 ## Summary
 
@@ -57,7 +58,11 @@ validation policy. The query grammar gains no reserved NaN identifier.
 
 ### Shared comparisons
 
-A lightweight scalar comparison header defines equality, ordering and hashing.
+A lightweight scalar comparison header defines FloatToSortableKey and derives
+equality, ordering and hashing from that key. FLOAT maps to uint32 and DOUBLE
+maps to uint64; zero normalizes to positive zero, negative bits are inverted,
+positive bits have their sign bit flipped, and every NaN maps to the maximum key.
+Go constant folding and query rewrites use the same typed key algorithm.
 Non-floating types retain their existing behavior. SQL floating comparisons use
 NaN equality and NaN-last ordering; signed zeros compare and hash equally.
 Sorting, binary search, map lookup, query-value deduplication and skip-index
@@ -68,7 +73,7 @@ retain their existing precision rules.
 ### Tantivy numeric keys
 
 Tantivy already encodes f64 terms as sortable uint64 keys. At every floating
-binding writer and query boundary, normalize NaN to the positive NaN bit pattern
+binding writer and query boundary, normalize signed zero to positive zero and NaN to the positive NaN bit pattern
 0x7fff_ffff_ffff_ffff. Both currently supported Tantivy encoders map that pattern
 to UINT64_MAX. Thus every NaN shares one term and sorts after +Inf, without changing
 the dependency revision, field type or posting format. Preserve actual unbounded
@@ -78,6 +83,9 @@ Scalar, batch, array and single-segment writers use the same normalization as
 term, term-set and one/two-bound range queries. JSON numeric query terms also use
 this boundary. Current native numeric schemas are indexed without FAST fields;
 any future FAST writer must use the same normalization rather than bypass it.
+JSON flat indexes also have FAST columns; strict JSON input cannot represent
+numeric NaN. NaN floating range bounds use typed inverted ranges instead of the
+FAST integer conversion that could otherwise turn NaN into zero.
 
 FLOAT source values remain 32-bit. Tantivy already widens FLOAT to f64 exactly;
 this change does not increase its key width. DOUBLE remains 64-bit.
@@ -114,7 +122,8 @@ older versions retain the existing high-cardinality INVERTED selection.
 Scalar engine version 6 advertises the new NaN key/comparison contract. No new
 physical container layout is introduced. New floating index writers reject valid
 NaN when explicitly asked to target an older reader that cannot implement this
-contract; ordinary data remains buildable at older negotiated versions.
+contract. Tantivy also gates negative-zero key normalization for older readers;
+ordinary data remains buildable at older negotiated versions.
 
 Old Tantivy indexes may split NaNs across keys and across both ends of the numeric
 order. Old SORT entries may be unordered. Old BITMAP maps may have merged NaN
@@ -122,7 +131,14 @@ with an ordinary key, losing distinctions that cannot be repaired from the index
 Therefore the production segment loader excludes pre-v6 floating scalar indexes,
 floating Array/Struct indexes and numeric/flat JSON indexes from its index cache,
 causing the raw field to load and execute instead. String/integer indexes are not
-excluded. Raw files must remain available, as required by normal scalar rebuilds.
+excluded. An exception is an explicit JSON cast-function index such as
+STRING_TO_DOUBLE: that function runs at index time and is not applied to original
+JSON scans. Falling back would change even finite string values such as "42".
+These old cast indexes report a rebuild-required error rather than silently
+change results. Rebuild them at v6 before loading with the new reader. The same
+comparison/key contract applies to the projected numeric value; original strings
+remain strings and are not implicitly cast by raw queries or JSON stats. Raw files
+must remain available, as required by normal scalar rebuilds.
 The existing scalar-version auto-upgrade/force-rebuild mechanism can rebuild these
 indexes from raw data at version 6; indexing resumes when new metadata is loaded.
 This implementation does not issue any production rebuild operation itself.
