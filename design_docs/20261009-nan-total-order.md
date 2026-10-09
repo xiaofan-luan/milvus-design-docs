@@ -10,8 +10,9 @@
 ## Summary
 
 Use one scalar floating-point comparison contract across raw scans, query constant
-folding, arrays, numeric indexes and skip-index pruning: all NaNs compare equal and
-sort after every non-NaN number, including positive infinity. Keep NaN distinct
+folding, arrays, every numeric scalar index, JSON stats and skip-index pruning:
+all NaNs compare equal and sort after every non-NaN number, including positive
+infinity. Keep NaN distinct
 from NULL. Normalize NaN only at numeric index-key boundaries; retain original
 source values and array positions. Ordinary Array HYBRID indexes may select
 STL_SORT at high cardinality on scalar engine version 6.
@@ -53,6 +54,11 @@ same order as execution. String "NaN" remains a string. Probability and distance
 parameters still require finite numbers. Scalar FLOAT/DOUBLE payloads accept NaN
 and infinities, matching floating array elements; vector data retains its finite
 validation policy. The query grammar gains no reserved NaN identifier.
+
+Integer columns and integer Array elements retain their typed-query constraints:
+NaN and infinities cannot be represented as integers and are rejected during
+query compilation, including nested whole-array values. FLOAT/DOUBLE and dynamic
+JSON numeric queries retain the floating total-order contract.
 
 ORDER BY and supported aggregation MIN/MAX, group keys and DISTINCT use the
 same sortable-key equality/order. NaN payloads form one group rather than
