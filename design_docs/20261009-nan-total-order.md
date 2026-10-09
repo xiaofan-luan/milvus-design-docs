@@ -54,6 +54,11 @@ parameters still require finite numbers. Scalar FLOAT/DOUBLE payloads accept NaN
 and infinities, matching floating array elements; vector data retains its finite
 validation policy. The query grammar gains no reserved NaN identifier.
 
+ORDER BY and supported aggregation MIN/MAX, group keys and DISTINCT use the
+same sortable-key equality/order. NaN payloads form one group rather than
+separate buckets; NULL remains a separate group. Existing temporary group-key
+normalization may widen FLOAT to DOUBLE without changing field storage widths.
+
 ## Index design
 
 ### Shared comparisons
