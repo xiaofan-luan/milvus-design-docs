@@ -42,6 +42,9 @@ immutable segment index. It cannot share occurrence counts across segments.
 An unusable condition means scan. A finite zero count of the selected necessary
 condition proves no matches; it does not require Locate. TRUE, an unsupported
 condition, or a preparation failure must never be interpreted as zero matches.
+If a condition is unusable, or even the full-active window cannot amortize
+preparation, the executor can establish the scan route before Count and retain
+eager raw-data prefetch. Useful conditions still defer Count until evaluation.
 
 ### Cost estimate before Locate
 
