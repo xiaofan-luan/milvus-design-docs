@@ -114,7 +114,10 @@ candidate bitmap is never stored as the final predicate result.
 ## Compatibility, Deprecation, and Migration Plan
 
 No query syntax, index format, RE2 package, or index build changes are required.
-The existing FM cost ratio remains the Locate cost control. Other scalar
+The implementation uses the current pattern-reader contract and the FM
+reader's existing construction-time cost ratio. The current loader uses its
+default ratio of 0.001; connecting that loader policy to runtime configuration
+is a separate existing concern. Other scalar
 operators and index types retain their routing. Cold-storage prefetch overlap
 and concurrent throughput need separate measurement; warm-data routing results
 do not establish those properties.
