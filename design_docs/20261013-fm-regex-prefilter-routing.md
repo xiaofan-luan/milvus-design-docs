@@ -68,6 +68,12 @@ full-segment bitmap construction and Boolean operations, batch bitmap slicing,
 and the remaining candidate reads and RE2 checks. Only reads and checks are
 scaled by the upstream density; Locate and full-segment bitmap work are not.
 
+The existing full-segment Locate ceiling, `C * SA < ratio * text_bytes`, remains
+an additional upper bound. The masked cost comparison can reject further plans
+within that bound. This keeps the initial scan weights from broadening the old
+dense acceptance range, especially for short rows. A finite zero-count proof
+remains exempt because it performs no Locate.
+
 The scan estimate includes both active string bytes and fixed batch work. The
 current sequential string scan constructs string views for each visited batch
 before skipping inactive rows. Upstream AND evaluation can skip entirely empty
