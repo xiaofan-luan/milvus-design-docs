@@ -68,6 +68,14 @@ full-segment bitmap construction and Boolean operations, batch bitmap slicing,
 and the remaining candidate reads and RE2 checks. Only reads and checks are
 scaled by the upstream density; Locate and full-segment bitmap work are not.
 
+The initial soft comparison prices Locate as
+`0.25 * C * max(1, SA) / ratio`, independently of the unscaled inherited
+ceiling below. The coefficient is a coarse relative weight chosen after
+paired warm native diagnostics showed that unit Locate pricing rejected
+useful medium-frequency and OR lookups. Those mixed query timings are not
+a pure Locate profile. Bitmap work and candidate rechecks retain separate
+terms, and broader corpora must validate this initial calibration.
+
 The existing full-segment Locate ceiling, `C * SA < ratio * text_bytes`, remains
 an additional upper bound. The masked cost comparison can reject further plans
 within that bound. This keeps the initial scan weights from broadening the old
@@ -136,11 +144,20 @@ tests exercise capture and cache hits on the deferred path.
 Paired benchmarks compare the exact parent commit and the candidate using the
 same compiler flags, corpus, queries, index settings, and host. They include
 ordinary masked scan, previous FM routing, and the new routing. Report every
-group, p50 and p95, cold expression preparation, correctness parity, observed
+group, p50 and p95, fresh-expression preparation, correctness parity, observed
 routes, and run-to-run noise. The initial warm fallback targets are at most 3%
 p50 and 5% p95 regression; results outside those targets require investigation.
-Use rebar and a larger line-oriented grep corpus rather than relying only on
-synthetic literal lookup timings.
+Each fresh-expression sample includes canonical RE2 construction and its
+first necessary-literal analysis; warming data/index does not share the
+matcher between expressions. Report cold I/O separately. Use rebar and a
+larger line-oriented grep corpus rather than relying only on synthetic
+literal lookup timings.
+
+Include a real parent AND where an indexed integer prefix matches only the
+first one or few physical batches. This verifies skipped batches rather
+than manually feeding empty masks into the regex leaf. With only a local
+batch bitmap available, extrapolating its density can overestimate future
+scan work for clustered matches; report such route misestimates explicitly.
 
 ## References
 
