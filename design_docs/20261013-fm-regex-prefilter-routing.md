@@ -9,7 +9,8 @@
 ## Summary
 
 Choose between FMIndex candidate generation and the ordinary masked regex scan
-using the selected literal occurrence counts and the current upstream bitmap.
+using the selected literal occurrence counts and the current upstream bitmap,
+including complete upstream work statistics when they are already available.
 Prepare index-local statistics once per physical expression, defer Locate until
 the bitmap is available, and reuse the resulting candidate bitmap. A routing
 estimate affects the execution strategy only; canonical RE2 evaluation and exact
@@ -33,8 +34,17 @@ The executor retains the eligibility checks for sealed scalar string fields
 with available raw data. For an eligible regex, it postpones the final route
 until evaluation receives the current batch's input bitmap.
 
-Preparation uses the expression's compiled RE2 matcher and its cached public
-necessary-literal analysis. It counts each distinct literal once and preserves
+Preparation uses the expression's compiled RE2 matcher and the public
+necessary-literal analysis. Each matcher still compiles and validates its own
+canonical RE2. With fixed private UTF-8/dot-newline options and extraction
+budgets, a thread retains only the last pattern's bounded public analysis values.
+Live matchers keep immutable shared ownership when that entry is replaced;
+the index condition is converted lazily once, so a cold raw-only scan need not
+convert an unused index tree. This cache holds neither compiled RE2 programs
+nor index-local Count statistics or row bitmaps. The pattern key must include
+options and budgets if they become configurable.
+
+The query counts each distinct literal once and preserves
 the existing selection policy: choose the least-cost child of an AND and retain
 all children of an OR. The prepared plan belongs to one expression and one
 immutable segment index. It cannot share occurrence counts across segments.
@@ -49,7 +59,7 @@ eager raw-data prefetch. Useful conditions still defer Count until evaluation.
 ### Cost estimate before Locate
 
 For total index rows `N`, selected occurrence cost `C`, remaining physical rows
-`U`, batch size `M`, and active input bits `B`, use:
+`U`, current batch size `M`, and active input bits `B`, the initial estimate is:
 
 ```text
 p = B / M
@@ -62,6 +72,27 @@ Count measures occurrences, not distinct rows. Clamping the count is a cheap
 initial estimate, and the intersection estimate assumes independence. Repeated
 text and correlated predicates can make it inaccurate. These assumptions may
 change routing performance but cannot remove a candidate or alter correctness.
+
+When the input bitmap covers the complete remaining window, use its actual
+active-row count instead of extrapolating `B/M`. Count the normal physical scan
+windows that contain active rows, including the exact final-window length.
+The raw fallback will only construct string views for those nonempty windows.
+Logical one-shot output size is not the physical scan-window size: a million-row
+mask with only128 active rows in its first8192-row window incurs one such view
+window, rather than a million views.
+
+For batched AND execution, a narrow optional provider can borrow the first,
+already-computed nonnullable numeric scalar predicate's complete exact bitmap.
+It lazily builds remaining active/nonempty-window suffix statistics once, then
+serves subsequent windows without reevaluating or pinning the prefix. The
+provider is scoped to the immediately following regex child and its input
+domain. Offset input, external masks, nullable or incomplete prefix caches,
+nested/combined predicates and moved cache contents do not supply this proof.
+Suffix metadata has a fixed8192-entry cap; tiny configured scan batches must
+not turn an optional routing estimate into unbounded per-row memory.
+When complete work statistics are unknown, retain the batch-density estimate
+and allow later batches to reconsider the plan. These statistics affect routing
+only; exact input-bit intersection still determines results.
 
 The FM estimate includes full-segment Locate work, suffix-array sampling rate,
 full-segment bitmap construction and Boolean operations, batch bitmap slicing,
@@ -107,11 +138,19 @@ no later, smaller window can amortize those fixed costs. The expression then
 uses the ordinary scan directly. This avoids repeated bitmap counts and cost
 calculations for common literals.
 
-Deferred FM regex expressions keep normal batch execution rather than claiming
-they can execute all at once. Scan fallback advances the data cursor once and
-synchronizes the index cursor; index execution and parent short-circuiting keep
-both cursors aligned. NULL, negation, offsets, chunk boundaries, and short final
-batches retain their existing semantics.
+Eligible FM regex expressions retain one-shot capability for the ordinary
+FilterBits driver, including exact zero-count and NOT queries. A deferred
+decision must not force accepted index queries into repeated driver batches.
+If the one-shot decision falls back, it still returns the full logical output
+but scans internally using the original normal physical batch length. It skips
+raw views in empty input windows and preserves their row validity. It restores
+the caller's batch state and leaves the input mask unchanged. Early known Raw
+routes and offset/iterative scans retain their normal execution.
+
+Raw fallback advances the data cursor once per physical window and synchronizes
+the index cursor after producing the logical output. Index execution and parent
+short-circuiting keep both cursors aligned. NULL, negation, offsets, chunk
+boundaries, and short final batches retain their existing semantics.
 
 When expression caching is enabled, the deferred regex evaluator explicitly
 allows lookup of an exact cached result. This prevents initially index-eligible
@@ -141,15 +180,23 @@ offsets, and parent AND short-circuiting. Test-only index spies verify that
 rejected plans do not Locate and accepted plans execute at most once. Cache
 tests exercise capture and cache hits on the deferred path.
 
+Exercise accepted and zero-count expressions through the real FilterBits
+driver, and exercise late one-shot raw fallback with complete sparse masks,
+NULL/NOT, multiple chunks and a short tail. Validate exact-work provider scope,
+remaining-window alignment and refusal of unknown input domains. Functional
+passes do not certify performance thresholds.
+
 Paired benchmarks compare the exact parent commit and the candidate using the
 same compiler flags, corpus, queries, index settings, and host. They include
 ordinary masked scan, previous FM routing, and the new routing. Report every
 group, p50 and p95, fresh-expression preparation, correctness parity, observed
 routes, and run-to-run noise. The initial warm fallback targets are at most 3%
 p50 and 5% p95 regression; results outside those targets require investigation.
-Each fresh-expression sample includes canonical RE2 construction and its
-first necessary-literal analysis; warming data/index does not share the
-matcher between expressions. Report cold I/O separately. Use rebar and a
+Each fresh-expression sample includes canonical RE2 construction and a fresh
+index-local Count plan. Repeated patterns may reuse the one-entry necessary
+analysis cache; report that preparation scope explicitly. Warming data/index
+does not share the compiled matcher between expressions. Report cold preparation
+and cold I/O separately. Use rebar and a
 larger line-oriented grep corpus rather than relying only on synthetic
 literal lookup timings.
 
@@ -158,6 +205,17 @@ first one or few physical batches. This verifies skipped batches rather
 than manually feeding empty masks into the regex leaf. With only a local
 batch bitmap available, extrapolating its density can overestimate future
 scan work for clustered matches; report such route misestimates explicitly.
+Where the already-computed exact prefix bitmap is available, verify that those
+limits reject Locate while the dense prefix still uses it. Compile both variants
+before measuring consecutive baseline-before, candidate and baseline-after
+controls in one task-owned window, then restore the original service. Keep every
+measurement and its source/runtime identity, including failures and noisy runs.
+
+The preserved clustered diagnostic's expression-observer wrapper changes the
+new provider's eligibility relative to its timed direct-leaf tree. Treat those
+opaque-wrapper counts as a separate unknown-scope observation. Use direct
+reader spies in functional tests to verify the production tree's routing;
+do not project an observer tree's counters onto a different timed tree.
 
 ## References
 
