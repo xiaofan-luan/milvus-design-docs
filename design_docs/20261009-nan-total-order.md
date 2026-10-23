@@ -1,21 +1,25 @@
-# MEP: NaN total order and sorted ordinary Array indexes
+# MEP: NaN total order for scalar data
 
 - **Created:** 2026-10-09
 - **Author:** @xiaofan-luan
 - **Status:** Draft
 - **Component:** Proxy, Index, QueryNode, DataNode, Coordinator
 - **Related PR:** https://github.com/milvus-io/milvus/pull/53972
+- **Implementation snapshot:** https://github.com/milvus-io/milvus/commit/aa1beb0c4624efbe5390301a7288d79d77a976d2
 - **Design document:** https://github.com/xiaofan-luan/milvus-design-docs/blob/design/nan-total-order-53972/design_docs/20261009-nan-total-order.md
+- **Submission note:** The upstream milvus-design-docs repository is archived; GitHub rejected PR creation. The design is published on the author fork for review.
 
 ## Summary
 
 Use one scalar floating-point comparison contract across raw scans, query constant
 folding, arrays, every numeric scalar index, JSON stats and skip-index pruning:
 all NaNs compare equal and sort after every non-NaN number, including positive
-infinity. Keep NaN distinct from NULL. Normalize NaN only at numeric index-key boundaries; retain original
-source values and array positions. Ordinary Array HYBRID indexes may select
-STL_SORT at high cardinality on scalar engine version 6. Writers enable the new
-key contract only when the negotiated scalar engine target is at least 6.
+infinity. Keep NaN distinct from NULL. Canonicalize comparison and dictionary keys;
+retain original source values and array positions. This continues from the ARRAY
+and typed JSON ARRAY support merged in [#54505](https://github.com/milvus-io/milvus/pull/54505).
+Its existing selection policy and 3.1.0 software gate remain unchanged. Writers
+enable the new NaN key contract only when the negotiated scalar engine target
+is at least 6.
 
 ## Motivation
 
@@ -72,6 +76,21 @@ ORDER BY and supported aggregation MIN/MAX, group keys and DISTINCT use the
 same sortable-key equality/order. NaN payloads form one group rather than
 separate buckets; NULL remains a separate group. Existing temporary group-key
 normalization may widen FLOAT to DOUBLE without changing field storage widths.
+The same rule applies to Go QUERY ORDER BY, custom function-chain scalar sorting
+and grouping, and numeric-combine MIN/MAX. Scalar columns and intermediate function-chain values use the same contract.
+The existing final `$score` validation still rejects nonfinite scores; NaN scalar
+field support does not change that boundary or vector validation. Existing
+finite-score epsilon tie behavior in segment merging remains unchanged. SUM,
+AVG and other arithmetic retain their existing behavior; their results use total
+ordering when subsequently compared.
+
+This aligns scalar NaN equality and ordering with PostgreSQL `real` and `double
+precision`; it does not claim full PostgreSQL SQL compatibility. NaN remains
+distinct from NULL and cannot be converted to an integer. Standard JSON numeric
+syntax still excludes NaN/Infinity; typed floating REST fields use the string
+representation described above. Arithmetic errors, extension/model behavior and
+vector validation remain separate contracts; XGBoost still interprets a NaN
+feature through the model's missing-value branch.
 
 ## Index design
 
@@ -140,8 +159,56 @@ false. Nested struct-array indexes retain their flattened element-offset domain.
 Numeric Array range matches use forward matching, since complementing mismatching
 element postings could remove a row that also has a matching element. Non-null
 empty arrays have no postings and remain valid; NULL arrays remain invalid.
-Version 6 enables ordinary Array HYBRID high-cardinality sorted parent postings;
-older versions retain the existing high-cardinality INVERTED selection.
+The parent-row posting implementation and ARRAY family selection come from
+#54505 and remain unchanged. NaN canonicalization is the new v6 capability; it
+does not replace the existing ARRAY software gate or alter the nested-index
+coordinate domain.
+
+### Builder, artifact, loader and reader integration
+
+Writers receive the negotiated scalar version through the current family build
+parameters. SORT and BITMAP preserve legacy writer comparisons below v6;
+INVERTED and full JSON writers set the same capability on the Tantivy wrapper.
+HYBRID scalar and ARRAY cardinality probes use the corresponding writer order.
+All reader lookups, range bounds, key maps and query deduplication use the shared
+comparison helpers. Legacy index eligibility is checked before those readers
+are installed. No deleted monolithic index class is restored.
+
+Tests build through the public registry, serialize actual artifacts, reload in
+synchronous/asynchronous heap and mmap modes, and compare postings against an
+independent total-order oracle. The matrix includes scalar rows, ordinary ARRAY
+parent rows and nested element coordinates.
+
+## Scalar clustering and partition statistics
+
+Floating clustering keys use the same canonical integer keys for counting,
+bucket planning and row-to-buffer lookup. Dictionary entries retain a source
+value for bounds; output rows preserve their original values. This prevents a
+NaN key from disappearing on lookup and places all NaN payloads in one bucket.
+
+Fresh FLOAT/DOUBLE bounds carry an additive `floatBoundsComplete` marker. Old
+bounds can silently omit stored NaNs even when both endpoints look finite, so
+new QueryNodes keep segments with unmarked floating bounds instead of pruning
+from them. Updating a legacy stats object does not promote its bounds to complete.
+
+The existing partition-stats JSON format cannot encode nonfinite numeric bounds.
+Keep exact bounds in memory, but omit the whole segment's optional stats entry
+when serializing such bounds. Missing entries mean unknown and do not remove
+logical segments or source rows. Finite stats retain ordinary numeric endpoints
+that old readers can decode. New pruning also treats absent bounds as unknown;
+term pruning must inspect later literals even if an earlier unsorted literal is
+larger than the segment's maximum.
+
+Older DataCoords turn a missing stats entry into an empty entry while remapping
+output segment IDs, which old QueryNodes cannot safely read. New DataCoords
+preserve missing entries and advertise `supports_partial_partition_stats` in
+compaction request JSON. New DataNodes require that capability only when scalar
+clustering encounters nonfinite values, before opening output writers. Worker
+local defaults must not advertise it on an older coordinator's behalf. Finite
+old-coordinator plans keep working. After the coordinator upgrade, a fresh
+compaction request carries the capability; retry/scheduling policies are unchanged.
+This gate does not support coordinator downgrade in the middle of unfinished
+partial-stats compactions.
 
 ## Compatibility and migration
 
@@ -173,7 +240,8 @@ This implementation does not issue any production rebuild operation itself.
 This is an intentional query semantic change. During a mixed-binary rolling
 upgrade, old QueryNodes still evaluate IEEE comparisons; index engine negotiation
 alone cannot make their raw scans use the new semantics. Consistent NaN results
-require completing the QueryNode/Proxy upgrade. Rebuild affected indexes at v6
+require completing the QueryNode/Proxy upgrade. Floating clustering and its
+statistics additionally require upgraded DataNodes and DataCoords. Rebuild affected indexes at v6
 before relying on indexed performance. Downgrading to old binaries after writing
 v6 NaN indexes requires rebuilding for the old version and reverts query semantics.
 No compatibility is promised for intermediate, unpublished skip-NaN formats from
@@ -181,9 +249,41 @@ this PR's earlier revisions.
 
 RLS policy evaluation is outside the scope of this change.
 
-Current implementation gap: segment resource estimates still use index metadata
-before the reader excludes legacy floating indexes. Their estimates must be
-aligned with raw fallback; this remains an outstanding follow-up.
+Loading admission and final resource estimates use the same index-eligibility
+rule as the native loader. Skipped legacy indexes contribute no index reservation
+and do not suppress raw-field memory or mmap disk accounting. Explicit old JSON
+cast indexes report the same rebuild-required error during estimation and loading.
+
+## End-to-end coverage boundaries
+
+The intended comparison contract covers scalar fields and intermediate scalar
+function-chain operations. Current master retains its finite final-score output
+validation. This change does not make nonfinite ANN/model scores valid public
+results. Scalar field ordering, grouping and raw/index parity must be checked
+separately from metric-score validation.
+
+Cached search iterators now use the public metric direction consistently for
+heap ordering, batch sorting, and continuation/range bounds. Similarity metrics
+(IP/COSINE) put NaN first under descending order; distance metrics put NaN last
+under ascending order. Comparisons restore the original score before applying
+the scalar order, because negating NaN does not reverse its position. A cached
+head rejected by a changed bound still refills its source chunk. The existing
+strict score-only continuation bound excludes equal scores, including equal
+NaNs; this is not a new tie-complete cursor protocol. Individual Knowhere
+iterators retain their existing ordered-input contract.
+
+Native ANN merge/refine comparators outside this cached-iterator wrapper remain
+separate from the scalar-function-chain contract. No universal claim about all
+ANN implementations is made.
+
+Typed protobuf results preserve NaN. A companion Rust SDK fix preserves
+nonfinite scalar/array/struct values and search scores in JSON-owned row APIs as
+"NaN", "Infinity", and "-Infinity"; actual NULL remains JSON null and native typed
+float access remains available. This SDK change is separate from the server PR.
+The Node HTTP client retains these quoted values as strings, and its request
+JSON serializer still turns a caller's numeric NaN into null unless the caller
+uses the quoted typed-value representation. Client serialization and SDK-specific
+row APIs require their own validation before claiming full end-to-end coverage.
 
 ## Test plan
 
@@ -196,6 +296,14 @@ posting domains, reloads in memory/mmap paths, legacy writer key/posting
 compatibility, loader raw fallback and existing scalar rebuild negotiation. Test compiler folding and
 query templates. Exercise SIMD scalar/tail/vector boundaries on supported CPU
 architectures, with independent expected results rather than native NaN equality.
+
+Exercise actual Go ORDER BY and function-chain operators, scalar clustering
+analysis through row mapping, partition-stats serialization/remapping, and
+segment pruning with legacy/missing bounds. Verify loading/final resource
+estimates match raw-only loading when legacy indexes are excluded, including
+independent index/raw mmap and tiered-eviction settings. Mixed-cluster rolling
+upgrade and downgrade behavior requires deployment-level validation in addition
+to unit-level compatibility tests.
 
 ## References
 
