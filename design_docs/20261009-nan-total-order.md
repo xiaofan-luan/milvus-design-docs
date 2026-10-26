@@ -5,7 +5,7 @@
 - **Status:** Draft
 - **Component:** Proxy, Index, QueryNode, DataNode, Coordinator
 - **Related PR:** https://github.com/milvus-io/milvus/pull/53972
-- **Implementation snapshot:** https://github.com/milvus-io/milvus/commit/aa1beb0c4624efbe5390301a7288d79d77a976d2
+- **Implementation snapshot:** https://github.com/milvus-io/milvus/commit/e9ecd6b5f508d5d6e6656a6f5e7673da66ad92de
 - **Design document:** https://github.com/xiaofan-luan/milvus-design-docs/blob/design/nan-total-order-53972/design_docs/20261009-nan-total-order.md
 - **Submission note:** The upstream milvus-design-docs repository is archived; GitHub rejected PR creation. The design is published on the author fork for review.
 
@@ -15,7 +15,8 @@ Use one scalar floating-point comparison contract across raw scans, query consta
 folding, arrays, every numeric scalar index, JSON stats and skip-index pruning:
 all NaNs compare equal and sort after every non-NaN number, including positive
 infinity. Keep NaN distinct from NULL. Canonicalize comparison and dictionary keys;
-retain original source values and array positions. This continues from the ARRAY
+this does not rewrite raw source columns or array positions. Index-derived values
+need not preserve each row's original floating bit pattern. This builds on ARRAY
 and typed JSON ARRAY support merged in [#54505](https://github.com/milvus-io/milvus/pull/54505).
 Its existing selection policy and 3.1.0 software gate remain unchanged. Writers
 enable the new NaN key contract only when the negotiated scalar engine target
@@ -72,12 +73,14 @@ NaN and infinities cannot be represented as integers and are rejected during
 query compilation, including nested whole-array values. FLOAT/DOUBLE and dynamic
 JSON numeric queries retain the floating total-order contract.
 
-ORDER BY and supported aggregation MIN/MAX, group keys and DISTINCT use the
-same sortable-key equality/order. NaN payloads form one group rather than
-separate buckets; NULL remains a separate group. Existing temporary group-key
-normalization may widen FLOAT to DOUBLE without changing field storage widths.
-The same rule applies to Go QUERY ORDER BY, custom function-chain scalar sorting
-and grouping, and numeric-combine MIN/MAX. Scalar columns and intermediate function-chain values use the same contract.
+ORDER BY and supported MIN/MAX use the same sortable-key equality/order. Existing
+internal grouping and DISTINCT-style deduplication, including function-chain
+grouping, use one key for all NaN payloads; NULL remains a separate group. This PR
+does not add public FLOAT/DOUBLE GROUP BY or DISTINCT support; existing admission
+constraints remain unchanged. Temporary group-key normalization may widen FLOAT
+to DOUBLE without changing field storage widths. Go QUERY ORDER BY,
+function-chain scalar sorting/grouping and numeric-combine MIN/MAX use the same
+contract for scalar columns and intermediate values.
 The existing final `$score` validation still rejects nonfinite scores; NaN scalar
 field support does not change that boundary or vector validation. Existing
 finite-score epsilon tie behavior in segment merging remains unchanged. SUM,
@@ -145,6 +148,10 @@ selection uses the same comparator and may choose BITMAP for low-cardinality dat
 containing NaN; it does not force STL_SORT merely because NaN occurs. Older build
 targets retain the original map/cardinality comparisons and postings; legacy
 compatibility does not promise the new NaN query semantics.
+Where value lookup is supported, BITMAP Lookup/Gather return a representative
+posting key, so a row's NaN sign/payload or zero sign may change on index readback.
+Raw source columns retain those original values; comparison equivalence does not
+promise bitwise identity for index-derived values.
 
 ### Ordinary Array postings
 
@@ -153,8 +160,9 @@ array contribute the same parent row, just as repeated ordinary values do. For
 rows [1,NaN,3,NaN], [3,5], [NaN], postings are 1->[0], 3->[0,1], 5->[1], NaN->[0,2].
 Contains-any unions postings; contains-all intersects them. Original array length
 and element positions are preserved outside the contains index. A scalar reverse
-lookup cannot reconstruct a whole array, so ordinary Array SORT keeps HasRawData
-false. Nested struct-array indexes retain their flattened element-offset domain.
+lookup cannot reconstruct a whole array, so ordinary Array SORT reports
+`Caps().value_lookup == false`. Nested struct-array indexes retain their flattened
+element-offset domain.
 
 Numeric Array range matches use forward matching, since complementing mismatching
 element postings could remove a row that also has a matching element. Non-null
@@ -212,11 +220,17 @@ partial-stats compactions.
 
 ## Compatibility and migration
 
-Scalar engine version 6 advertises the new NaN key/comparison contract. No new
-physical container layout is introduced. Before the cluster can negotiate
-version 6, writers keep the legacy comparator/encoder path for the selected
-target. Valid NaN and signed zero do not fail a build merely because the target
-is older. Canonical NaN keys are enabled only for targets at least 6. No new
+Scalar engine version 6 advertises the new persisted NaN key contract without a
+new physical container layout. With registered QueryNodes, DataCoord starts from
+their lowest current scalar version. A configured `targetScalarIndexVersion`
+raises that version unless force-rebuild selects the target directly; the result
+is clamped to the shared reader-supported range. The DataNode then caps the build
+version to its own supported maximum and reports the actual version in metadata.
+Canonical NaN keys are written only when that actual build version is at least 6.
+Lower targets retain legacy writer comparisons/encoding; valid NaN and signed
+zero do not fail a build merely because the target is older. New Proxy constant
+comparisons and QueryNode raw scans use the new semantics immediately, without
+waiting for a v6 index. The existing ARRAY 3.1.0 software gate is unchanged. No new
 retry state or scheduler behavior is introduced.
 
 Old Tantivy indexes may split NaNs across keys and across both ends of the numeric
@@ -224,8 +238,10 @@ order. Old SORT entries may be unordered. Old BITMAP maps may have merged NaN
 with an ordinary key, losing distinctions that cannot be repaired from the index.
 Therefore the production segment loader excludes pre-v6 floating scalar indexes,
 floating Array/Struct indexes and numeric/flat JSON indexes from its index cache,
-causing the raw field to load and execute instead. String/integer indexes are not
-excluded. An exception is an explicit JSON cast-function index such as
+causing the raw field to load and execute instead. This applies even if an
+affected index contains only finite values: its metadata cannot prove that its
+old floating keys are lossless. String/integer indexes are not excluded. An
+exception is an explicit JSON cast-function index such as
 STRING_TO_DOUBLE: that function runs at index time and is not applied to original
 JSON scans. Falling back would change even finite string values such as "42".
 These old cast indexes report a rebuild-required error rather than silently
@@ -235,7 +251,11 @@ remain strings and are not implicitly cast by raw queries or JSON stats. Raw fil
 must remain available, as required by normal scalar rebuilds.
 The existing scalar-version auto-upgrade/force-rebuild mechanism can rebuild these
 indexes from raw data at version 6; indexing resumes when new metadata is loaded.
-This implementation does not issue any production rebuild operation itself.
+Both `dataCoord.autoUpgradeSegmentIndex` and
+`dataCoord.forceRebuildScalarSegmentIndex` default to false. Upgrading binaries
+alone does not schedule migration of existing indexes; rebuilding requires an
+explicit action or enabling the applicable existing policy and target. This PR
+does not issue any production rebuild operation itself.
 
 This is an intentional query semantic change. During a mixed-binary rolling
 upgrade, old QueryNodes still evaluate IEEE comparisons; index engine negotiation
@@ -276,16 +296,21 @@ Native ANN merge/refine comparators outside this cached-iterator wrapper remain
 separate from the scalar-function-chain contract. No universal claim about all
 ANN implementations is made.
 
-Typed protobuf results preserve NaN. A companion Rust SDK fix preserves
-nonfinite scalar/array/struct values and search scores in JSON-owned row APIs as
-"NaN", "Infinity", and "-Infinity"; actual NULL remains JSON null and native typed
-float access remains available. This SDK change is separate from the server PR.
-The Node HTTP client retains these quoted values as strings, and its request
-JSON serializer still turns a caller's numeric NaN into null unless the caller
-uses the quoted typed-value representation. Client serialization and SDK-specific
-row APIs require their own validation before claiming full end-to-end coverage.
+Typed protobuf floating results can carry NaN. JSON-owned SDK row APIs need
+companion handling for nonfinite scalar/array/struct values as "NaN", "Infinity"
+and "-Infinity", while actual NULL stays JSON null. Such SDK fixes and their
+release status are outside this server PR and are not established by its tests.
+HTTP clients may expose the quoted values as strings; JavaScript request JSON
+serialization turns numeric NaN into null unless callers use the quoted typed
+representation. Client serialization and SDK-specific row APIs require their own
+validation before claiming full end-to-end coverage.
 
 ## Test plan
+
+Recorded validation covers x86 native and Go regressions plus Go SDK raw/index
+round trips. It does not establish coverage for other SDKs or their releases.
+ARM SIMD execution and actual mixed-binary rolling-upgrade/downgrade deployments
+have not been run; they remain validation work in addition to the matrix below.
 
 Compare raw and SORT/BITMAP/INVERTED/HYBRID results for positive and negative NaNs
 with several payloads, infinities, signed zeros, ordinary numbers and NULLs. Cover
