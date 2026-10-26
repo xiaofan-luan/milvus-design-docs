@@ -5,7 +5,7 @@
 - **Status:** Draft
 - **Component:** Proxy, Index, QueryNode, DataNode, Coordinator
 - **Related PR:** https://github.com/milvus-io/milvus/pull/53972
-- **Implementation snapshot:** https://github.com/milvus-io/milvus/commit/e9ecd6b5f508d5d6e6656a6f5e7673da66ad92de
+- **Implementation snapshot:** https://github.com/milvus-io/milvus/commit/999cd2c67d852eb18d9aa4ef46a25fb4ab89a4f4
 - **Design document:** https://github.com/xiaofan-luan/milvus-design-docs/blob/design/nan-total-order-53972/design_docs/20261009-nan-total-order.md
 - **Submission note:** The upstream milvus-design-docs repository is archived; GitHub rejected PR creation. The design is published on the author fork for review.
 
@@ -81,6 +81,9 @@ constraints remain unchanged. Temporary group-key normalization may widen FLOAT
 to DOUBLE without changing field storage widths. Go QUERY ORDER BY,
 function-chain scalar sorting/grouping and numeric-combine MIN/MAX use the same
 contract for scalar columns and intermediate values.
+Shared array/object heap constructors use this order for floating keys, including
+named floating types. Custom `HeapInterface` implementations retain their
+caller-supplied comparison semantics.
 The existing final `$score` validation still rejects nonfinite scores; NaN scalar
 field support does not change that boundary or vector validation. Existing
 finite-score epsilon tie behavior in segment merging remains unchanged. SUM,
